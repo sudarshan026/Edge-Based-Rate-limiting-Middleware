@@ -4,48 +4,40 @@
 #
 # Services
 # --------
-#   redis           Central Redis 7 — global quota store
+#   redis           Central Redis 7 — global quota store (local fallback)
 #   origin          Origin Server (port 8000, internal only)
 #   shield          Origin Shield with batch-sync daemon (port 9000, internal)
 #   edge-mumbai     Regional Edge POP — Mumbai    (host port 8001)
 #   edge-delhi      Regional Edge POP — Delhi     (host port 8002)
 #   edge-bengaluru  Regional Edge POP — Bengaluru (host port 8003)
 #
-# Flow:  loadtest → edge-* (8001-8003) → shield (9000) → origin (8000) → redis (6379)
+# AWS Cloud Services (activated via .env)
+# ----------------------------------------
+#   ElastiCache  → replaces local Redis when ELASTICACHE_URL is set
+#   CloudWatch   → centralised logs from shield + all edge POPs
+#   SNS          → alert on every HTTP 429 rate-limit event
+#   S3           → periodic JSONL audit-log flush
+#
+# Flow:  loadtest → edge-* (8001-8003) → shield (9000) → origin (8000) → redis/elasticache
 # =============================================================================
-
-# ---------------------------------------------------------------------------
-# Shared build definition (all Python services use the same image)
-# ---------------------------------------------------------------------------
-x-python-build: &python-build
-  context: .
-  dockerfile: Dockerfile
-
-# Force amd64 on all services (prevents arm64 exec-format errors on x86_64 hosts)
-x-platform: &platform
-  platform: linux/amd64
-
-# Shared health-check defaults
-x-healthcheck-defaults: &hc-defaults
-  interval: 5s
-  timeout: 3s
-  retries: 10
-  start_period: 10s
 
 services:
 
   # --------------------------------------------------------------------------
-  # Central Redis — no custom code, just the data store
+  # Central Redis — local fallback when ELASTICACHE_URL is not set
   # --------------------------------------------------------------------------
   redis:
     image: redis:7-alpine
-    <<: *platform
+    platform: linux/amd64
     container_name: rl-redis
     command: redis-server --save "" --appendonly no --loglevel notice
     ports:
       - "6379:6379"
     healthcheck:
-      <<: *hc-defaults
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
       test: ["CMD", "redis-cli", "ping"]
     networks:
       - rl-net
@@ -55,18 +47,22 @@ services:
   # --------------------------------------------------------------------------
   origin:
     build:
-      <<: *python-build
-    <<: *platform
+      context: .
+      dockerfile: Dockerfile
+    platform: linux/amd64
     container_name: rl-origin
     volumes:
       - ./origin/main.py:/app/main.py:ro
     command: uvicorn main:app --host 0.0.0.0 --port 8000 --log-level info
     environment:
-      - PYTHONUNBUFFERED=1
+      PYTHONUNBUFFERED: "1"
     expose:
       - "8000"
     healthcheck:
-      <<: *hc-defaults
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
       test: ["CMD", "curl", "-sf", "http://localhost:8000/health"]
     networks:
       - rl-net
@@ -76,26 +72,44 @@ services:
 
   # --------------------------------------------------------------------------
   # Origin Shield  (rate limiting + batch sync daemon)
+  # AWS: ElastiCache, CloudWatch, SNS, S3
   # --------------------------------------------------------------------------
   shield:
     build:
-      <<: *python-build
-    <<: *platform
+      context: .
+      dockerfile: Dockerfile
+    platform: linux/amd64
     container_name: rl-shield
+    env_file:
+      - path: .env
+        required: false
     volumes:
       - ./shield/main.py:/app/main.py:ro
     command: uvicorn main:app --host 0.0.0.0 --port 9000 --log-level info
     environment:
-      - PYTHONUNBUFFERED=1
-      - ORIGIN_URL=http://origin:8000
-      - REDIS_URL=redis://redis:6379
-      - BUCKET_CAPACITY=20
-      - REFILL_PER_SEC=10
-      - SYNC_INTERVAL=1.0
+      PYTHONUNBUFFERED: "1"
+      ORIGIN_URL: http://origin:8000
+      # Local Redis fallback — overridden by ELASTICACHE_URL from .env
+      REDIS_URL: redis://redis:6379
+      # AWS services — loaded from .env; empty = feature disabled
+      ELASTICACHE_URL: ${ELASTICACHE_URL:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-ap-southeast-2}
+      CLOUDWATCH_LOG_GROUP: ${CLOUDWATCH_LOG_GROUP:-/edge-rate-limiter}
+      SNS_TOPIC_ARN: ${SNS_TOPIC_ARN:-}
+      S3_AUDIT_BUCKET: ${S3_AUDIT_BUCKET:-}
+      S3_FLUSH_INTERVAL: ${S3_FLUSH_INTERVAL:-30}
+      BUCKET_CAPACITY: "20"
+      REFILL_PER_SEC: "10"
+      SYNC_INTERVAL: "1.0"
     expose:
       - "9000"
     healthcheck:
-      <<: *hc-defaults
+      interval: 5s
+      timeout: 6s
+      retries: 10
+      start_period: 15s
       test: ["CMD", "curl", "-sf", "http://localhost:9000/health"]
     networks:
       - rl-net
@@ -108,23 +122,35 @@ services:
   # --------------------------------------------------------------------------
   # Regional Edge POPs  (Mumbai / Delhi / Bengaluru)
   # All three run identical code; POP_NAME distinguishes them.
+  # AWS: CloudWatch logs per POP (stream = edge-{pop})
   # --------------------------------------------------------------------------
   edge-mumbai:
     build:
-      <<: *python-build
-    <<: *platform
+      context: .
+      dockerfile: Dockerfile
+    platform: linux/amd64
     container_name: rl-edge-mumbai
+    env_file:
+      - path: .env
+        required: false
     volumes:
       - ./edge/main.py:/app/main.py:ro
     command: uvicorn main:app --host 0.0.0.0 --port 8001 --log-level info
     environment:
-      - PYTHONUNBUFFERED=1
-      - POP_NAME=mumbai
-      - SHIELD_URL=http://shield:9000
+      PYTHONUNBUFFERED: "1"
+      POP_NAME: mumbai
+      SHIELD_URL: http://shield:9000
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-ap-southeast-2}
+      CLOUDWATCH_LOG_GROUP: ${CLOUDWATCH_LOG_GROUP:-/edge-rate-limiter}
     ports:
       - "8001:8001"
     healthcheck:
-      <<: *hc-defaults
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
       test: ["CMD", "curl", "-sf", "http://localhost:8001/health"]
     networks:
       - rl-net
@@ -134,20 +160,31 @@ services:
 
   edge-delhi:
     build:
-      <<: *python-build
-    <<: *platform
+      context: .
+      dockerfile: Dockerfile
+    platform: linux/amd64
     container_name: rl-edge-delhi
+    env_file:
+      - path: .env
+        required: false
     volumes:
       - ./edge/main.py:/app/main.py:ro
     command: uvicorn main:app --host 0.0.0.0 --port 8002 --log-level info
     environment:
-      - PYTHONUNBUFFERED=1
-      - POP_NAME=delhi
-      - SHIELD_URL=http://shield:9000
+      PYTHONUNBUFFERED: "1"
+      POP_NAME: delhi
+      SHIELD_URL: http://shield:9000
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-ap-southeast-2}
+      CLOUDWATCH_LOG_GROUP: ${CLOUDWATCH_LOG_GROUP:-/edge-rate-limiter}
     ports:
       - "8002:8002"
     healthcheck:
-      <<: *hc-defaults
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
       test: ["CMD", "curl", "-sf", "http://localhost:8002/health"]
     networks:
       - rl-net
@@ -157,20 +194,31 @@ services:
 
   edge-bengaluru:
     build:
-      <<: *python-build
-    <<: *platform
+      context: .
+      dockerfile: Dockerfile
+    platform: linux/amd64
     container_name: rl-edge-bengaluru
+    env_file:
+      - path: .env
+        required: false
     volumes:
       - ./edge/main.py:/app/main.py:ro
     command: uvicorn main:app --host 0.0.0.0 --port 8003 --log-level info
     environment:
-      - PYTHONUNBUFFERED=1
-      - POP_NAME=bengaluru
-      - SHIELD_URL=http://shield:9000
+      PYTHONUNBUFFERED: "1"
+      POP_NAME: bengaluru
+      SHIELD_URL: http://shield:9000
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-ap-southeast-2}
+      CLOUDWATCH_LOG_GROUP: ${CLOUDWATCH_LOG_GROUP:-/edge-rate-limiter}
     ports:
       - "8003:8003"
     healthcheck:
-      <<: *hc-defaults
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
       test: ["CMD", "curl", "-sf", "http://localhost:8003/health"]
     networks:
       - rl-net

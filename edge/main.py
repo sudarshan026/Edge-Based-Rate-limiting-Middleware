@@ -8,6 +8,20 @@ Responsibilities:
   • Pass through rate-limit response headers (Retry-After, X-RateLimit-*)
   • Add x-served-by-pop for observability
   • Does NOT perform any rate limiting itself
+
+AWS Cloud Services (optional — activated when env vars are set)
+---------------------------------------------------------------
+• AWS CloudWatch : Structured logs from every POP forwarded to a central
+                   CloudWatch log group (CLOUDWATCH_LOG_GROUP env var).
+                   Each POP gets its own log stream (stream name = POP_NAME).
+                   Falls back to stdout-only logging when not configured.
+
+Env vars
+--------
+POP_NAME              : POP identifier              (default: unknown-pop)
+SHIELD_URL            : Origin Shield URL           (default: http://shield:9000)
+AWS_DEFAULT_REGION    : AWS region for CloudWatch   (default: ap-south-1)
+CLOUDWATCH_LOG_GROUP  : CloudWatch log group name   (optional)
 """
 from __future__ import annotations
 
@@ -24,6 +38,8 @@ from fastapi.responses import JSONResponse, Response
 # ---------------------------------------------------------------------------
 POP_NAME: str = os.environ.get("POP_NAME", "unknown-pop")
 SHIELD_URL: str = os.environ.get("SHIELD_URL", "http://shield:9000")
+AWS_REGION: str = os.environ.get("AWS_DEFAULT_REGION", "ap-south-1")
+CLOUDWATCH_LOG_GROUP: str = os.environ.get("CLOUDWATCH_LOG_GROUP", "")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -57,6 +73,51 @@ HOP_BY_HOP = {
 
 
 # ---------------------------------------------------------------------------
+# AWS CloudWatch — optional structured log forwarding
+# ---------------------------------------------------------------------------
+def _setup_cloudwatch_logging() -> None:
+    """
+    Attach a CloudWatch log handler to the root logger so every log line
+    emitted by this edge POP is also shipped to AWS CloudWatch.
+
+    • Log group  : CLOUDWATCH_LOG_GROUP  (e.g. /edge-rate-limiter)
+    • Log stream : POP_NAME              (e.g. edge-mumbai)
+
+    Silently skips setup if CLOUDWATCH_LOG_GROUP is not set or if boto3 /
+    watchtower are unavailable — local-only mode continues to work normally.
+    """
+    if not CLOUDWATCH_LOG_GROUP:
+        logger.info("CloudWatch logging disabled (CLOUDWATCH_LOG_GROUP not set).")
+        return
+
+    try:
+        import boto3                        # noqa: PLC0415
+        import watchtower                   # noqa: PLC0415
+
+        cw_client = boto3.client("logs", region_name=AWS_REGION)
+        cw_handler = watchtower.CloudWatchLogHandler(
+            log_group_name=CLOUDWATCH_LOG_GROUP,
+            stream_name=f"edge-{POP_NAME}",   # e.g.  edge-mumbai
+            boto3_client=cw_client,
+            create_log_group=True,             # creates the group if absent
+        )
+        cw_handler.setFormatter(
+            logging.Formatter(
+                f"%(asctime)s [{POP_NAME.upper()}] %(levelname)s %(message)s"
+            )
+        )
+        logging.getLogger().addHandler(cw_handler)
+        logger.info(
+            "✅ AWS CloudWatch logging enabled  group=%s  stream=edge-%s  region=%s",
+            CLOUDWATCH_LOG_GROUP, POP_NAME, AWS_REGION,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "CloudWatch setup failed (%s) — falling back to stdout only.", exc
+        )
+
+
+# ---------------------------------------------------------------------------
 # HTTP client (shared, reused across requests)
 # ---------------------------------------------------------------------------
 _http_client: httpx.AsyncClient | None = None
@@ -71,6 +132,10 @@ def get_http_client() -> httpx.AsyncClient:
 async def lifespan(app: FastAPI):
     global _http_client
     logger.info("Edge POP '%s' starting — shield=%s", POP_NAME, SHIELD_URL)
+
+    # ── AWS CloudWatch ──────────────────────────────────────────────────────
+    _setup_cloudwatch_logging()
+
     _http_client = httpx.AsyncClient(
         base_url=SHIELD_URL,
         timeout=httpx.Timeout(10.0),
@@ -89,7 +154,12 @@ app = FastAPI(title=f"Edge Worker — {POP_NAME}", lifespan=lifespan)
 # ---------------------------------------------------------------------------
 @app.get("/health")
 async def health():
-    return {"status": "ok", "pop": POP_NAME, "shield": SHIELD_URL}
+    return {
+        "status": "ok",
+        "pop": POP_NAME,
+        "shield": SHIELD_URL,
+        "cloudwatch_log_group": CLOUDWATCH_LOG_GROUP or "disabled",
+    }
 
 
 # ---------------------------------------------------------------------------
