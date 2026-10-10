@@ -29,24 +29,52 @@ Write-Host ""
 Write-Host "[STEP 0] Checking container status..." -ForegroundColor Yellow
 docker compose ps
 
-Wait-For-Enter "Press Enter to test the Edge POP Health endpoints..."
+Wait-For-Enter "Press Enter to test the CDN and Edge POP Health endpoints..."
 
 # -------------------------------------------------------------------------
 # STEP 1: Health Checks
 # -------------------------------------------------------------------------
-Write-Host "[STEP 1] Checking Mumbai Edge POP (Port 8001)..." -ForegroundColor Yellow
+Write-Host "[STEP 1a] Checking CDN / Edge Network (Port 8080)..." -ForegroundColor Yellow
+$cdnHealth = Invoke-RestMethod -Uri "http://localhost:8080/cdn-health"
+$cdnHealth | ConvertTo-Json -Depth 5 | Write-Host
+
+Write-Host "`n[STEP 1b] Checking Mumbai Edge POP (Port 8001)..." -ForegroundColor Yellow
 $mumbaiHealth = Invoke-RestMethod -Uri "http://localhost:8001/health"
 $mumbaiHealth | ConvertTo-Json -Depth 5 | Write-Host
 
-Write-Host "`n[STEP 1] Checking Delhi Edge POP (Port 8002)..." -ForegroundColor Yellow
+Write-Host "`n[STEP 1c] Checking Delhi Edge POP (Port 8002)..." -ForegroundColor Yellow
 $delhiHealth = Invoke-RestMethod -Uri "http://localhost:8002/health"
 $delhiHealth | ConvertTo-Json -Depth 5 | Write-Host
 
-Write-Host "`n[STEP 1] Checking Bengaluru Edge POP (Port 8003)..." -ForegroundColor Yellow
+Write-Host "`n[STEP 1d] Checking Bengaluru Edge POP (Port 8003)..." -ForegroundColor Yellow
 $blrHealth = Invoke-RestMethod -Uri "http://localhost:8003/health"
 $blrHealth | ConvertTo-Json -Depth 5 | Write-Host
 
+Wait-For-Enter "Press Enter to test requests through the CDN..."
+
+# -------------------------------------------------------------------------
+# STEP 1.5: CDN Routing Demo
+# -------------------------------------------------------------------------
+Write-Host "[STEP 1.5] Sending request through CDN with X-Region: mumbai..." -ForegroundColor Yellow
+$cdnMumbai = Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="mumbai"}
+Write-Host "Status: $($cdnMumbai.StatusCode)"
+Write-Host "X-CDN-Routed-To: $($cdnMumbai.Headers['X-CDN-Routed-To'])"
+Write-Host "x-served-by-pop: $($cdnMumbai.Headers['x-served-by-pop'])"
+
+Write-Host "`n[STEP 1.5] Sending request through CDN with X-Region: delhi..." -ForegroundColor Yellow
+$cdnDelhi = Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="delhi"}
+Write-Host "Status: $($cdnDelhi.StatusCode)"
+Write-Host "X-CDN-Routed-To: $($cdnDelhi.Headers['X-CDN-Routed-To'])"
+Write-Host "x-served-by-pop: $($cdnDelhi.Headers['x-served-by-pop'])"
+
+Write-Host "`n[STEP 1.5] Sending request through CDN with NO region (round-robin)..." -ForegroundColor Yellow
+$cdnRR = Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"}
+Write-Host "Status: $($cdnRR.StatusCode)"
+Write-Host "X-CDN-Routed-To: $($cdnRR.Headers['X-CDN-Routed-To'])"
+Write-Host "x-served-by-pop: $($cdnRR.Headers['x-served-by-pop'])"
+
 Wait-For-Enter "Press Enter to test normal allowed requests..."
+
 
 # -------------------------------------------------------------------------
 # STEP 2: Normal Requests

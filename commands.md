@@ -7,24 +7,25 @@ docker compose up -d
 docker compose ps
 ```
 
-### 2. Verify all 3 Edge POPs are alive
+### 2. Verify CDN and all 3 Edge POPs are alive
 ```powershell
+Invoke-RestMethod http://localhost:8080/cdn-health
 Invoke-RestMethod http://localhost:8001/health
 Invoke-RestMethod http://localhost:8002/health
 Invoke-RestMethod http://localhost:8003/health
 ```
 
-### 3. Normal Requests (Notice `X-RateLimit-Remaining` decreases globally)
+### 3. Normal Requests through CDN (Notice `X-RateLimit-Remaining` decreases globally)
 ```powershell
-Invoke-WebRequest -Uri "http://localhost:8001/products" -Headers @{"x-api-key"="demo-key"}
-Invoke-WebRequest -Uri "http://localhost:8002/products" -Headers @{"x-api-key"="demo-key"}
-Invoke-WebRequest -Uri "http://localhost:8003/products" -Headers @{"x-api-key"="demo-key"}
+Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="mumbai"}
+Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="delhi"}
+Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="bengaluru"}
 ```
 
-### 4. Trigger 429 Rate Limit (Run 30 requests rapidly)
+### 4. Trigger 429 Rate Limit (Run 30 requests rapidly through CDN)
 ```powershell
 for ($i=1; $i -le 30; $i++) {
-    $r = Invoke-WebRequest -Uri "http://localhost:8001/products" -Headers @{"x-api-key"="demo-key"} -SkipHttpErrorCheck
+    $r = Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"} -SkipHttpErrorCheck
     Write-Host "Req $i : HTTP $($r.StatusCode)"
 }
 ```
@@ -32,11 +33,15 @@ for ($i=1; $i -le 30; $i++) {
 ### 5. Watch Token Refill (Wait 3 seconds, then try again)
 ```powershell
 Start-Sleep -Seconds 3
-Invoke-WebRequest -Uri "http://localhost:8001/products" -Headers @{"x-api-key"="demo-key"}
+Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"}
 ```
 
 ### 6. Run the Global Load Test (Proves limits are shared across POPs)
 ```powershell
+# Via CDN (Simulates geographic routing)
+python loadtest.py --cdn
+
+# Or bypass CDN, hitting POPs directly
 python loadtest.py
 ```
 

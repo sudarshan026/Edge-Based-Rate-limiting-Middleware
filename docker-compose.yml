@@ -4,6 +4,7 @@
 #
 # Services
 # --------
+#   cdn             CDN / Edge Network simulator — Nginx (host port 8080)
 #   redis           Central Redis 7 — global quota store (local fallback)
 #   origin          Origin Server (port 8000, internal only)
 #   shield          Origin Shield with batch-sync daemon (port 9000, internal)
@@ -18,10 +19,42 @@
 #   SNS          → alert on every HTTP 429 rate-limit event
 #   S3           → periodic JSONL audit-log flush
 #
-# Flow:  loadtest → edge-* (8001-8003) → shield (9000) → origin (8000) → redis/elasticache
+# Flow:  loadtest → cdn (8080) → edge-* (8001-8003) → shield (9000) → origin (8000) → redis/elasticache
 # =============================================================================
 
 services:
+
+  # --------------------------------------------------------------------------
+  # CDN / Edge Network — Nginx reverse proxy (entry point for all clients)
+  #
+  # Simulates Cloudflare / AWS CloudFront:
+  #   • Routes to nearest POP via X-Region header (mumbai/delhi/bengaluru)
+  #   • Falls back to round-robin when no region header is present
+  #   • Adds X-CDN-Routed-To response header for observability
+  # --------------------------------------------------------------------------
+  cdn:
+    image: nginx:1.27-alpine
+    platform: linux/amd64
+    container_name: rl-cdn
+    volumes:
+      - ./cdn/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "8080:80"
+    healthcheck:
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+      test: ["CMD", "wget", "-qO-", "http://localhost:80/cdn-health"]
+    networks:
+      - rl-net
+    depends_on:
+      edge-mumbai:
+        condition: service_healthy
+      edge-delhi:
+        condition: service_healthy
+      edge-bengaluru:
+        condition: service_healthy
 
   # --------------------------------------------------------------------------
   # Central Redis — local fallback when ELASTICACHE_URL is not set

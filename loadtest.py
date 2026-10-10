@@ -5,6 +5,7 @@ Behaviour
 ---------
 • Fires ~200 req/s against a single API key for 10 seconds (≈ 2 000 total requests)
 • Spreads requests round-robin across all 3 edge POPs (ports 8001, 8002, 8003)
+  OR routes through the CDN entry point (port 8080) with X-Region header rotation
 • Tallies 200 (allowed) vs 429 (rate-limited) vs other status codes
 • Prints a formatted summary at the end
 
@@ -25,6 +26,7 @@ Usage
 -----
   python loadtest.py [--rps 200] [--duration 10] [--api-key test-key-1]
                      [--pops 8001,8002,8003] [--concurrency 50]
+  python loadtest.py --cdn          # route all traffic through CDN on port 8080
 
 Requirements: Python 3.12 standard library only (no extra packages needed).
 """
@@ -51,16 +53,21 @@ if sys.stderr.encoding and sys.stderr.encoding.lower() not in ("utf-8", "utf8"):
 # ---------------------------------------------------------------------------
 # Single request (uses stdlib urllib — no extra deps)
 # ---------------------------------------------------------------------------
-def _do_request(url: str, api_key: str) -> int:
+# Regions used for CDN X-Region header rotation
+CDN_REGIONS = ["mumbai", "delhi", "bengaluru"]
+
+
+def _do_request(url: str, api_key: str, extra_headers: dict[str, str] | None = None) -> int:
     """Send a single GET and return the HTTP status code."""
-    req = urllib.request.Request(
-        url,
-        headers={
-            "x-api-key": api_key,
-            "User-Agent": "rl-loadtest/1.0",
-            "Accept": "application/json",
-        },
-    )
+    headers = {
+        "x-api-key": api_key,
+        "User-Agent": "rl-loadtest/1.0",
+        "Accept": "application/json",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
+
+    req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=5) as resp:
             return resp.status  # type: ignore[return-value]
@@ -81,6 +88,8 @@ async def _run_load_test(
     duration: float,
     concurrency: int,
     path: str,
+    cdn_mode: bool = False,
+    cdn_port: int = 8080,
 ) -> Counter[int]:
     """
     Send `rps` requests per second for `duration` seconds, round-robin across
@@ -99,9 +108,11 @@ async def _run_load_test(
     semaphore = asyncio.Semaphore(concurrency)
     loop = asyncio.get_running_loop()
 
-    async def worker(url: str) -> None:
+    async def worker(url: str, extra_headers: dict[str, str] | None = None) -> None:
         async with semaphore:
-            status = await loop.run_in_executor(None, _do_request, url, api_key)
+            status = await loop.run_in_executor(
+                None, _do_request, url, api_key, extra_headers
+            )
             async with lock:
                 status_counter[status] += 1
 
@@ -109,22 +120,34 @@ async def _run_load_test(
     start = time.monotonic()
     interval = 1.0 / rps  # ideal spacing between requests
 
+    if cdn_mode:
+        routing_label = f"CDN (localhost:{cdn_port}) → auto-routes to POPs"
+    else:
+        routing_label = f"{[f'localhost:{p}' for p in pops]}"
+
     print(
         f"\n🚀  Load test starting — "
         f"{rps} req/s × {duration:.0f}s = ~{total_to_send} total requests\n"
         f"    API key : {api_key}\n"
-        f"    POPs    : {[f'localhost:{p}' for p in pops]}\n"
+        f"    Mode    : {'CDN (port ' + str(cdn_port) + ')' if cdn_mode else 'Direct POP'}\n"
+        f"    Routing : {routing_label}\n"
         f"    Path    : {path}\n"
         f"{'─' * 58}"
     )
 
     for i in range(total_to_send):
-        # Pick next POP round-robin
-        async with pop_idx_lock:
-            port = pop_cycle[i % len(pops)]
-
-        url = f"http://localhost:{port}{path}"
-        tasks.append(asyncio.create_task(worker(url)))
+        if cdn_mode:
+            # All traffic goes through CDN; rotate X-Region header for geographic simulation
+            region = CDN_REGIONS[i % len(CDN_REGIONS)]
+            url = f"http://localhost:{cdn_port}{path}"
+            extra = {"X-Region": region}
+            tasks.append(asyncio.create_task(worker(url, extra)))
+        else:
+            # Direct POP mode — pick next POP round-robin
+            async with pop_idx_lock:
+                port = pop_cycle[i % len(pops)]
+            url = f"http://localhost:{port}{path}"
+            tasks.append(asyncio.create_task(worker(url)))
 
         # Throttle dispatch to approximately `rps` per second
         elapsed = time.monotonic() - start
@@ -168,6 +191,8 @@ def main() -> None:
     parser.add_argument("--pops",        type=str,   default="8001,8002,8003", help="Comma-separated host ports")
     parser.add_argument("--concurrency", type=int,   default=50,          help="Max concurrent in-flight requests")
     parser.add_argument("--path",        type=str,   default="/products",  help="Request path")
+    parser.add_argument("--cdn",         action="store_true",              help="Route all traffic through the CDN (port 8080) instead of direct to POPs")
+    parser.add_argument("--cdn-port",    type=int,   default=8080,        help="CDN host port (default: 8080)")
     args = parser.parse_args()
 
     pops = [int(p.strip()) for p in args.pops.split(",")]
@@ -182,6 +207,8 @@ def main() -> None:
             duration=args.duration,
             concurrency=args.concurrency,
             path=args.path,
+            cdn_mode=args.cdn,
+            cdn_port=args.cdn_port,
         )
     )
 

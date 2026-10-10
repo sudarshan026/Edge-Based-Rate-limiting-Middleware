@@ -4,17 +4,18 @@ A production-grade, globally consistent, edge-based distributed rate limiting sy
 
 ```
 Global Users
-    │ API requests
+    │ API requests (HTTPS)
     ▼
-CDN / Edge Network  (simulated by 3 edge containers)
+CDN / Edge Network  (Nginx reverse proxy — host:8080)
+    │  Routes by X-Region header or round-robin
     │
-    ├── Edge POP — Mumbai     (host:8001)  ──► AWS CloudWatch Logs
-    ├── Edge POP — Delhi      (host:8002)  ──► AWS CloudWatch Logs
-    └── Edge POP — Bengaluru  (host:8003)  ──► AWS CloudWatch Logs
+    ├── Edge POP — Mumbai     (port 8001)  ──► AWS CloudWatch Logs
+    ├── Edge POP — Delhi      (port 8002)  ──► AWS CloudWatch Logs
+    └── Edge POP — Bengaluru  (port 8003)  ──► AWS CloudWatch Logs
              │
              │  x-client-id + x-pop headers
              ▼
-    Origin Shield  (host:9000, internal)
+    Origin Shield  (port 9000, internal)
         │  Token Bucket (local, in-memory, zero-latency)
         │  Batch Sync Daemon  ──►  AWS ElastiCache (Redis)
         │                    ◄──  authoritative global tokens
@@ -52,12 +53,13 @@ CDN / Edge Network  (simulated by 3 edge containers)
 
 ## Architecture Overview
 
-| Service | Role | Rate Limiting? | AWS Integration |
-|---|---|---|---|
-| **edge-\*** | Identify client, add headers, forward to shield | ❌ None | CloudWatch Logs |
-| **shield** | Token bucket allow/deny, proxy to origin | ✅ **Yes — enforced here** | ElastiCache + CloudWatch + SNS + S3 |
-| **origin** | Dynamic app logic, returns products | ❌ None | None |
-| **redis** | Global quota store (local fallback) | N/A (data store) | Replaced by ElastiCache when configured |
+| Service | Role | Port | Rate Limiting? | AWS Integration |
+|---|---|---|---|---|
+| **cdn** | Nginx reverse proxy — routes to nearest POP | `8080` (entry point) | ❌ None | None |
+| **edge-\*** | Identify client, add headers, forward to shield | `8001-8003` | ❌ None | CloudWatch Logs |
+| **shield** | Token bucket allow/deny, proxy to origin | `9000` (internal) | ✅ **Yes — enforced here** | ElastiCache + CloudWatch + SNS + S3 |
+| **origin** | Dynamic app logic, returns products | `8000` (internal) | ❌ None | None |
+| **redis** | Global quota store (local fallback) | `6379` (internal) | N/A (data store) | Replaced by ElastiCache when configured |
 
 ---
 
@@ -112,12 +114,17 @@ This project integrates **4 AWS cloud services** for production-grade observabil
 
 ```
 .
-├── docker-compose.yml        # Orchestrates all 6 services with AWS env vars
+├── docker-compose.yml        # Orchestrates all 7 services with AWS env vars
 ├── Dockerfile                # Shared Python 3.12-slim image for all services
 ├── requirements.txt          # Python dependencies (FastAPI, Redis, boto3, watchtower)
 ├── .env.example              # Template for AWS credentials and service config
 ├── .env                      # Your actual credentials (git-ignored, never committed)
 ├── .gitignore                # Protects .env from being committed
+│
+├── cdn/
+│   └── nginx.conf            # CDN / Edge Network — Nginx reverse proxy config
+│                              #   Routes by X-Region header or round-robin
+│                              #   Adds X-CDN-Routed-To response header
 │
 ├── edge/
 │   └── main.py               # Edge Worker — client identification, header tagging,
@@ -132,7 +139,7 @@ This project integrates **4 AWS cloud services** for production-grade observabil
 │   └── main.py               # Origin Server — simulates a dynamic API with
 │                              #   a hardcoded product catalogue
 │
-├── loadtest.py               # Load testing script (200 req/s × 10s across all POPs)
+├── loadtest.py               # Load testing script (200 req/s × 10s, CDN or direct mode)
 ├── demo.ps1                  # Interactive PowerShell demo script
 ├── commands.md               # Quick-reference demo commands
 │
@@ -144,6 +151,28 @@ This project integrates **4 AWS cloud services** for production-grade observabil
 ---
 
 ## 🔧 How Each Service Works
+
+### CDN / Edge Network (`cdn/nginx.conf`)
+
+The CDN layer is an **Nginx reverse proxy** that simulates a real CDN like Cloudflare or AWS CloudFront. It is the **single entry point** for all client traffic on port **8080**.
+
+**Routing behaviour:**
+
+| Request Header | Routing Decision |
+|---|---|
+| `X-Region: mumbai` | Routes to Mumbai POP (port 8001) |
+| `X-Region: delhi` | Routes to Delhi POP (port 8002) |
+| `X-Region: bengaluru` (or `blr`, `bangalore`) | Routes to Bengaluru POP (port 8003) |
+| `X-Region: mum` | Routes to Mumbai POP (alias) |
+| `X-Region: del` | Routes to Delhi POP (alias) |
+| No `X-Region` header | **Round-robin** across all 3 POPs |
+
+**Features:**
+1. **Geographic routing simulation** — uses the `X-Region` header to simulate geographic proximity-based routing that real CDNs perform via IP geolocation
+2. **Round-robin fallback** — evenly distributes requests across all 3 POPs when no region preference is specified
+3. **Observability headers** — adds `X-CDN-Routed-To` (which region was selected) and `X-CDN-Node` (CDN identifier) response headers
+4. **Health endpoint** — `GET /cdn-health` returns CDN status and available POPs
+5. **Pass-through** — all client headers (`x-api-key`, `X-Forwarded-For`, etc.) are preserved through to the Edge POP
 
 ### Edge Worker (`edge/main.py`)
 
@@ -188,20 +217,28 @@ A simple FastAPI application that simulates a real API backend:
 
 ### Load Test Script (`loadtest.py`)
 
-The load tester validates that the global rate limit works correctly:
+The load tester validates that the global rate limit works correctly. It supports two modes:
+
+| Mode | Command | How it works |
+|---|---|---|
+| **Direct POP** (default) | `python loadtest.py` | Round-robin across all 3 Edge POP ports directly |
+| **CDN** | `python loadtest.py --cdn` | All traffic through port 8080 with `X-Region` header rotation |
 
 | Parameter | Default | Description |
 |---|---|---|
 | `--rps` | `200` | Target requests per second |
 | `--duration` | `10.0` | Test duration in seconds |
 | `--api-key` | `test-key-1` | Client identity (API key) |
-| `--pops` | `8001,8002,8003` | Edge POP ports to target |
+| `--pops` | `8001,8002,8003` | Edge POP ports to target (direct mode) |
 | `--concurrency` | `50` | Max concurrent in-flight requests |
 | `--path` | `/products` | Request path |
+| `--cdn` | `false` | Route all traffic through CDN (port 8080) |
+| `--cdn-port` | `8080` | CDN host port |
 
 **How it works:**
 - Fires `200 req/s × 10s = ~2,000 total requests` using a single API key
-- Distributes requests **round-robin** across all 3 edge POPs
+- **Direct mode:** distributes requests **round-robin** across all 3 edge POP ports
+- **CDN mode:** sends all requests to port 8080 with rotating `X-Region` headers (`mumbai` → `delhi` → `bengaluru` → ...)
 - Uses `asyncio` + thread pool for concurrent HTTP requests (stdlib only, no extra deps)
 - Tallies `200` (allowed) vs `429` (rate-limited) vs other status codes
 - Prints live progress every 200 requests
@@ -220,20 +257,30 @@ The script **PASSES** if the 200 count falls within `[84, 180]` — proving that
 
 ## 🔑 Key Design Properties
 
-1. **Global limits, not per-POP** — A client alternating between Mumbai, Delhi, and Bengaluru still shares _one_ token bucket tracked in Central Redis / ElastiCache.
-2. **Zero-latency hot path** — Allow/deny decisions use an in-memory token bucket; _no_ synchronous Redis call during request processing.
-3. **Eventual convergence** — The Batch Sync Daemon reconciles local state with Redis every `SYNC_INTERVAL` seconds (default: 1s).
-4. **Drift compensation** — After each sync, local tokens are set to the authoritative global count, preventing long-term divergence.
-5. **Redis fail-open** — If Redis / ElastiCache is unavailable, the shield keeps serving from its local bucket and retries the sync next cycle.
-6. **Clock-skew-free sync** — The Lua script uses Redis's own `TIME` command, not the container's wall clock.
-7. **Fire-and-forget AWS** — SNS and S3 operations run in background tasks and never block the request path. Failures are logged and retried.
-8. **Graceful degradation** — Every AWS integration is optional. The system works identically in local-only mode when env vars are absent.
+1. **Single entry point** — All client traffic enters through the CDN (port 8080) which routes to the nearest POP based on `X-Region` header or round-robin.
+2. **Global limits, not per-POP** — A client alternating between Mumbai, Delhi, and Bengaluru still shares _one_ token bucket tracked in Central Redis / ElastiCache.
+3. **Zero-latency hot path** — Allow/deny decisions use an in-memory token bucket; _no_ synchronous Redis call during request processing.
+4. **Eventual convergence** — The Batch Sync Daemon reconciles local state with Redis every `SYNC_INTERVAL` seconds (default: 1s).
+5. **Drift compensation** — After each sync, local tokens are set to the authoritative global count, preventing long-term divergence.
+6. **Redis fail-open** — If Redis / ElastiCache is unavailable, the shield keeps serving from its local bucket and retries the sync next cycle.
+7. **Clock-skew-free sync** — The Lua script uses Redis's own `TIME` command, not the container's wall clock.
+8. **Fire-and-forget AWS** — SNS and S3 operations run in background tasks and never block the request path. Failures are logged and retried.
+9. **Graceful degradation** — Every AWS integration is optional. The system works identically in local-only mode when env vars are absent.
 
 ---
 
 ## Configuration Reference
 
 All configuration is done via environment variables in `docker-compose.yml` and `.env`.
+
+### CDN / Edge Network
+
+| Setting | Value | Description |
+|---|---|---|
+| Host port | `8080` | Single entry point for all client traffic |
+| Routing | `X-Region` header | Routes to specific POP (`mumbai`, `delhi`, `bengaluru`) |
+| Fallback | Round-robin | Distributes evenly when no `X-Region` header is set |
+| Health endpoint | `/cdn-health` | Returns CDN status and available POPs |
 
 ### Shield
 
@@ -270,15 +317,28 @@ All configuration is done via environment variables in `docker-compose.yml` and 
 
 ## Running the Load Test
 
+### Direct POP Mode (default)
+
 ```bash
 python loadtest.py
 ```
+
+Sends 200 req/s round-robin directly to edge POP ports 8001, 8002, 8003.
+
+### CDN Mode
+
+```bash
+python loadtest.py --cdn
+```
+
+Sends 200 req/s through the CDN entry point (port 8080) with rotating `X-Region` headers (`mumbai` → `delhi` → `bengaluru` → ...), simulating real-world geographic traffic.
 
 **Sample output:**
 ```
 🚀  Load test starting — 200 req/s × 10s = ~2000 total requests
     API key : test-key-1
-    POPs    : ['localhost:8001', 'localhost:8002', 'localhost:8003']
+    Mode    : CDN (port 8080)
+    Routing : CDN (localhost:8080) → auto-routes to POPs
     Path    : /products
 ──────────────────────────────────────────────────────────
   [  200/2000]  [OK] 200:    25  [RL] 429:   117  [ERR] other:    0  elapsed: 1.0s
@@ -319,17 +379,24 @@ python loadtest.py
 ```
 1. Client sends:
    GET /products  HTTP/1.1
-   Host: localhost:8001
+   Host: localhost:8080
    x-api-key: my-client
+   X-Region: mumbai
 
-2. Edge POP (Mumbai) receives request on :8001
+2. CDN / Edge Network (Nginx on :8080) receives request
+   • Reads X-Region header → "mumbai"
+   • Routes to upstream edge-mumbai (port 8001)
+   • (If no X-Region header → round-robin across all 3 POPs)
+   • Adds X-CDN-Routed-To: mumbai response header
+
+3. Edge POP (Mumbai) receives request on :8001
    • Extracts identity: client_id = "key:my-client"
    • Adds headers:  x-client-id: key:my-client
                     x-pop: mumbai
    • Forwards to Shield at http://shield:9000/products
    • Logs to AWS CloudWatch (stream: edge-mumbai)
 
-3. Origin Shield receives forwarded request
+4. Origin Shield receives forwarded request
    • Looks up (or creates) in-memory token bucket for "key:my-client"
    • Refills bucket based on time elapsed since last consume()
    • Tries to consume 1 token (LOCAL, zero-latency decision):
@@ -343,7 +410,7 @@ python loadtest.py
                     logs audit event to S3 buffer
                     does NOT contact Origin Server
 
-4. (Async, every 1s) Batch Sync Daemon wakes up
+5. (Async, every 1s) Batch Sync Daemon wakes up
    • For each client with unsynced usage:
      - Captures delta (tokens consumed since last sync)
      - Runs Lua script atomically on Redis / ElastiCache:
@@ -353,18 +420,19 @@ python loadtest.py
          * Returns authoritative global token count
      - Reconciles local bucket: local_tokens ← global_tokens
 
-5. (Async, every 30s) S3 Audit Flush Daemon wakes up
+6. (Async, every 30s) S3 Audit Flush Daemon wakes up
    • Collects all buffered audit events
    • Writes as timestamped JSONL file to S3
    • Re-queues on failure (no data loss)
 
-6. Origin Server processes allowed request
+7. Origin Server processes allowed request
    • Queries "database" (hardcoded product list)
    • Returns JSON product catalogue
 
-7. Response travels back:
+8. Response travels back:
    Origin → Shield (adds X-RateLimit headers)
           → Edge POP (adds x-served-by-pop header)
+          → CDN (adds X-CDN-Routed-To header)
           → Client
 ```
 
@@ -378,30 +446,56 @@ python loadtest.py
 docker compose ps
 ```
 
-All 6 containers should show `(healthy)`.
+All 7 containers should show `(healthy)`:
+- `rl-cdn` — CDN / Edge Network (Nginx)
+- `rl-redis` — Central Redis
+- `rl-origin` — Origin Server
+- `rl-shield` — Origin Shield
+- `rl-edge-mumbai` — Mumbai POP
+- `rl-edge-delhi` — Delhi POP
+- `rl-edge-bengaluru` — Bengaluru POP
 
-### Step 2 — Check Edge POP health endpoints
+### Step 2 — Check CDN and Edge POP health endpoints
 
 ```powershell
+# CDN health
+Invoke-RestMethod http://localhost:8080/cdn-health
+
+# Edge POP health
 Invoke-RestMethod http://localhost:8001/health    # Mumbai
 Invoke-RestMethod http://localhost:8002/health    # Delhi
 Invoke-RestMethod http://localhost:8003/health    # Bengaluru
 ```
 
-### Step 3 — Send normal requests (watch X-RateLimit-Remaining decrease globally)
+### Step 3 — Test CDN routing (geographic simulation)
 
 ```powershell
-Invoke-WebRequest -Uri "http://localhost:8001/products" -Headers @{"x-api-key"="demo-key"}
-Invoke-WebRequest -Uri "http://localhost:8002/products" -Headers @{"x-api-key"="demo-key"}
-Invoke-WebRequest -Uri "http://localhost:8003/products" -Headers @{"x-api-key"="demo-key"}
+# Route through Mumbai via CDN
+Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="mumbai"}
+
+# Route through Delhi via CDN
+Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="delhi"}
+
+# Round-robin (no region specified)
+Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"}
 ```
 
-### Step 4 — Trigger 429 Rate Limit (exhaust bucket)
+Check the `X-CDN-Routed-To` and `x-served-by-pop` response headers to verify routing.
+
+### Step 4 — Send normal requests (watch X-RateLimit-Remaining decrease globally)
+
+```powershell
+Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="mumbai"}
+Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="delhi"}
+Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="bengaluru"}
+```
+
+### Step 5 — Trigger 429 Rate Limit (exhaust bucket)
 
 ```powershell
 for ($i=1; $i -le 25; $i++) {
     try {
-        $r = Invoke-WebRequest -Uri "http://localhost:8001/products" -Headers @{"x-api-key"="demo-key"}
+        $r = Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"}
         Write-Host "Req $i : HTTP $($r.StatusCode)" -ForegroundColor Green
     } catch {
         Write-Host "Req $i : HTTP 429 (RATE LIMITED!)" -ForegroundColor Red
@@ -409,27 +503,31 @@ for ($i=1; $i -le 25; $i++) {
 }
 ```
 
-### Step 5 — Watch token refill (wait 3 seconds, then try again)
+### Step 6 — Watch token refill (wait 3 seconds, then try again)
 
 ```powershell
 Start-Sleep -Seconds 3
-Invoke-WebRequest -Uri "http://localhost:8001/products" -Headers @{"x-api-key"="demo-key"}
+Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"}
 # Should return HTTP 200 — tokens have refilled!
 ```
 
-### Step 6 — Run the global load test
+### Step 7 — Run the global load test
 
 ```powershell
+# Via CDN (recommended — simulates real-world flow)
+python loadtest.py --cdn
+
+# Or direct to POPs (bypasses CDN)
 python loadtest.py
 ```
 
-### Step 7 — Verify AWS services received data
+### Step 8 — Verify AWS services received data
 
 - **CloudWatch**: https://console.aws.amazon.com/cloudwatch → Log groups → `/edge-rate-limiter`
 - **SNS**: Check your email inbox for rate-limit alert notifications
 - **S3**: https://console.aws.amazon.com/s3 → `rate-limiter-audit-logs` → `audit-logs/shield/`
 
-### Step 8 — Inspect Redis state
+### Step 9 — Inspect Redis state
 
 ```powershell
 docker exec -it rl-redis redis-cli
@@ -471,11 +569,12 @@ echo "All files pass py_compile"
 | **Python 3.12** | All services are written in Python |
 | **FastAPI** | High-performance async web framework |
 | **Uvicorn** | ASGI server for running FastAPI apps |
+| **Nginx 1.27** | CDN / Edge Network reverse proxy with geographic routing |
 | **httpx** | Async HTTP client for inter-service communication |
 | **redis-py** | Python Redis client with async support |
 | **boto3** | AWS SDK for Python (SNS, S3) |
 | **watchtower** | CloudWatch log handler for Python logging |
-| **Docker Compose** | Multi-container orchestration |
+| **Docker Compose** | Multi-container orchestration (7 services) |
 | **Redis 7 (Alpine)** | In-memory data store for token bucket sync |
 
 ---
