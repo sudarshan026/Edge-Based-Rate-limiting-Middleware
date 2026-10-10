@@ -7,11 +7,12 @@ Run this script to step through the entire demonstration automatically with paus
 $ErrorActionPreference = "Stop"
 
 function Wait-For-Enter {
-    param([string]$Message = "Press Enter to continue to the next step...")
+    param([string]$Message = "Continuing in 5 seconds...")
     Write-Host ""
     Write-Host "================================================================================" -ForegroundColor Cyan
-    Read-Host -Prompt $Message
+    Write-Host $Message -ForegroundColor Cyan
     Write-Host "================================================================================" -ForegroundColor Cyan
+    Start-Sleep -Seconds 5
     Write-Host ""
 }
 
@@ -56,19 +57,19 @@ Wait-For-Enter "Press Enter to test requests through the CDN..."
 # STEP 1.5: CDN Routing Demo
 # -------------------------------------------------------------------------
 Write-Host "[STEP 1.5] Sending request through CDN with X-Region: mumbai..." -ForegroundColor Yellow
-$cdnMumbai = Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="mumbai"}
+$cdnMumbai = Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="mumbai"}
 Write-Host "Status: $($cdnMumbai.StatusCode)"
 Write-Host "X-CDN-Routed-To: $($cdnMumbai.Headers['X-CDN-Routed-To'])"
 Write-Host "x-served-by-pop: $($cdnMumbai.Headers['x-served-by-pop'])"
 
 Write-Host "`n[STEP 1.5] Sending request through CDN with X-Region: delhi..." -ForegroundColor Yellow
-$cdnDelhi = Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="delhi"}
+$cdnDelhi = Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="delhi"}
 Write-Host "Status: $($cdnDelhi.StatusCode)"
 Write-Host "X-CDN-Routed-To: $($cdnDelhi.Headers['X-CDN-Routed-To'])"
 Write-Host "x-served-by-pop: $($cdnDelhi.Headers['x-served-by-pop'])"
 
 Write-Host "`n[STEP 1.5] Sending request through CDN with NO region (round-robin)..." -ForegroundColor Yellow
-$cdnRR = Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"}
+$cdnRR = Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"}
 Write-Host "Status: $($cdnRR.StatusCode)"
 Write-Host "X-CDN-Routed-To: $($cdnRR.Headers['X-CDN-Routed-To'])"
 Write-Host "x-served-by-pop: $($cdnRR.Headers['x-served-by-pop'])"
@@ -79,15 +80,15 @@ Wait-For-Enter "Press Enter to test normal allowed requests..."
 # -------------------------------------------------------------------------
 # STEP 2: Normal Requests
 # -------------------------------------------------------------------------
-Write-Host "[STEP 2] Sending a normal request to Mumbai POP..." -ForegroundColor Yellow
-$mumbaiResp = Invoke-WebRequest -Uri "http://localhost:8001/products" -Headers @{"x-api-key"="demo-key"}
+Write-Host "[STEP 2] Sending a normal request through CDN to Mumbai POP..." -ForegroundColor Yellow
+$mumbaiResp = Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="mumbai"}
 Write-Host "Status: $($mumbaiResp.StatusCode)"
 Write-Host "x-served-by-pop: $($mumbaiResp.Headers['x-served-by-pop'])"
 Write-Host "X-RateLimit-Limit: $($mumbaiResp.Headers['x-ratelimit-limit'])"
 Write-Host "X-RateLimit-Remaining: $($mumbaiResp.Headers['x-ratelimit-remaining'])"
 
-Write-Host "`n[STEP 2] Sending a normal request to Delhi POP..." -ForegroundColor Yellow
-$delhiResp = Invoke-WebRequest -Uri "http://localhost:8002/products" -Headers @{"x-api-key"="demo-key"}
+Write-Host "`n[STEP 2] Sending a normal request through CDN to Delhi POP..." -ForegroundColor Yellow
+$delhiResp = Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="delhi"}
 Write-Host "Status: $($delhiResp.StatusCode)"
 Write-Host "x-served-by-pop: $($delhiResp.Headers['x-served-by-pop'])"
 Write-Host "X-RateLimit-Remaining: $($delhiResp.Headers['x-ratelimit-remaining'])"
@@ -97,10 +98,15 @@ Wait-For-Enter "Notice how the X-RateLimit-Remaining decreased globally. Press E
 # -------------------------------------------------------------------------
 # STEP 3: Trigger 429 Rate Limit
 # -------------------------------------------------------------------------
-Write-Host "[STEP 3] Spamming Mumbai POP to exhaust the bucket (25 requests)..." -ForegroundColor Yellow
+Write-Host "[STEP 3] Attempting to exhaust the bucket with 25 sequential requests..." -ForegroundColor Yellow
+Write-Host "(Note: The bucket organically refills at 10 requests/sec. Because this PowerShell loop" -ForegroundColor Gray
+Write-Host " sends requests slightly slower than that, the bucket may refill faster than we can drain it." -ForegroundColor Gray
+Write-Host " If you only see HTTP 200s here, that is proof of the organic 10/sec refill working! We will" -ForegroundColor Gray
+Write-Host " completely crush the bucket concurrently in Step 5.)`n" -ForegroundColor Gray
+
 for ($i = 1; $i -le 25; $i++) {
     try {
-        $r = Invoke-WebRequest -Uri "http://localhost:8001/products" -Headers @{"x-api-key"="demo-key"} -ErrorAction Stop
+        $r = Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"} -ErrorAction Stop
         Write-Host "Req $i : HTTP $($r.StatusCode)" -ForegroundColor Green
     } catch {
         Write-Host "Req $i : HTTP $($_.Exception.Response.StatusCode) (RATE LIMITED!)" -ForegroundColor Red
@@ -122,8 +128,8 @@ Wait-For-Enter "Press Enter to wait 3 seconds and see the bucket refill automati
 Write-Host "[STEP 4] Waiting 3 seconds for token refill..." -ForegroundColor Yellow
 Start-Sleep -Seconds 3
 
-Write-Host "`n[STEP 4] Retrying Mumbai POP..." -ForegroundColor Yellow
-$mumbaiRetry = Invoke-WebRequest -Uri "http://localhost:8001/products" -Headers @{"x-api-key"="demo-key"}
+Write-Host "`n[STEP 4] Retrying through CDN..." -ForegroundColor Yellow
+$mumbaiRetry = Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"}
 Write-Host "Status: $($mumbaiRetry.StatusCode) (Tokens refilled!)" -ForegroundColor Green
 Write-Host "X-RateLimit-Remaining: $($mumbaiRetry.Headers['x-ratelimit-remaining'])"
 
@@ -132,10 +138,10 @@ Wait-For-Enter "Press Enter to run the GLOBAL Load Test (Proof that limits are s
 # -------------------------------------------------------------------------
 # STEP 5: Load Test
 # -------------------------------------------------------------------------
-Write-Host "[STEP 5] Running Global Load Test (python loadtest.py)..." -ForegroundColor Yellow
-Write-Host "This will blast all 3 POPs round-robin at 200 req/s for 10 seconds."
+Write-Host "[STEP 5] Running Global Load Test (python loadtest.py --cdn)..." -ForegroundColor Yellow
+Write-Host "This will blast the CDN entry point at 200 req/s for 10 seconds."
 Write-Host "Watch the output below:`n"
-python loadtest.py
+python loadtest.py --cdn
 
 Wait-For-Enter "Press Enter to see how to stream live Docker logs..."
 

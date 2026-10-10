@@ -17,15 +17,18 @@ Invoke-RestMethod http://localhost:8003/health
 
 ### 3. Normal Requests through CDN (Notice `X-RateLimit-Remaining` decreases globally)
 ```powershell
-Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="mumbai"}
-Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="delhi"}
-Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="bengaluru"}
+Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="mumbai"}
+Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="delhi"}
+Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="bengaluru"}
 ```
 
 ### 4. Trigger 429 Rate Limit (Run 30 requests rapidly through CDN)
+
+*(Note: Because PowerShell loops are slow (~8 req/s) and the bucket refills at 10 req/s, this sequential loop may not actually exhaust the bucket depending on your computer's speed. Step 6's concurrent load test guarantees exhaustion).*
+
 ```powershell
 for ($i=1; $i -le 30; $i++) {
-    $r = Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"} -SkipHttpErrorCheck
+    $r = Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"} -SkipHttpErrorCheck
     Write-Host "Req $i : HTTP $($r.StatusCode)"
 }
 ```
@@ -33,7 +36,7 @@ for ($i=1; $i -le 30; $i++) {
 ### 5. Watch Token Refill (Wait 3 seconds, then try again)
 ```powershell
 Start-Sleep -Seconds 3
-Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"}
+Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"}
 ```
 
 ### 6. Run the Global Load Test (Proves limits are shared across POPs)

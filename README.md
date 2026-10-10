@@ -471,13 +471,13 @@ Invoke-RestMethod http://localhost:8003/health    # Bengaluru
 
 ```powershell
 # Route through Mumbai via CDN
-Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="mumbai"}
+Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="mumbai"}
 
 # Route through Delhi via CDN
-Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="delhi"}
+Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="delhi"}
 
 # Round-robin (no region specified)
-Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"}
+Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"}
 ```
 
 Check the `X-CDN-Routed-To` and `x-served-by-pop` response headers to verify routing.
@@ -485,17 +485,19 @@ Check the `X-CDN-Routed-To` and `x-served-by-pop` response headers to verify rou
 ### Step 4 — Send normal requests (watch X-RateLimit-Remaining decrease globally)
 
 ```powershell
-Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="mumbai"}
-Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="delhi"}
-Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="bengaluru"}
+Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="mumbai"}
+Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="delhi"}
+Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="bengaluru"}
 ```
 
 ### Step 5 — Trigger 429 Rate Limit (exhaust bucket)
 
+*(Note: Because PowerShell loops are slow (~8 req/s) and the bucket refills at 10 req/s, this sequential loop may not actually exhaust the bucket depending on your computer's speed. Step 7's concurrent load test guarantees exhaustion).*
+
 ```powershell
 for ($i=1; $i -le 25; $i++) {
     try {
-        $r = Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"}
+        $r = Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"} -ErrorAction Stop
         Write-Host "Req $i : HTTP $($r.StatusCode)" -ForegroundColor Green
     } catch {
         Write-Host "Req $i : HTTP 429 (RATE LIMITED!)" -ForegroundColor Red
@@ -507,7 +509,7 @@ for ($i=1; $i -le 25; $i++) {
 
 ```powershell
 Start-Sleep -Seconds 3
-Invoke-WebRequest -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"}
+Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"}
 # Should return HTTP 200 — tokens have refilled!
 ```
 
