@@ -1,0 +1,11 @@
+(Pro tip: During the demo, it's highly recommended to open a 
+second terminal window and run docker compose logs -f shield 
+so the audience can see the Shield processing decisions a
+nd background syncing to Redis in real-time!)
+
+
+.\demo.ps1
+
+docker compose logs -f shield
+
+
