@@ -806,11 +806,14 @@ Provides a physical, visual metaphor for the in-memory token bucket algorithm:
 * **Falling Token Droplets**: Every allowed request visibly consumes a token, dropping a liquid bead out of the bottom of the vessel. Incoming refills drip in continuously from the top.
 * **Authoritative Reference Markers**:
   * White Dashed Line (`CAP`): Maximum burst capacity (e.g., 20 tokens).
-  * Amber Dashed Line (`GLOBAL`): The authoritative global count reported back by Redis during the last 1-second sync cycle.
-* **Drift Readout**: Shows $| \text{local} - \text{global} |$, verifying how closely the edge node tracks the global cluster.
-* **Unsynced $\Delta$**: Displays the number of consumed tokens queued locally for the next sync.
-* **Mini Token History Chart**: A rolling 60-second line chart showing token levels over time.
-* **Dynamic Plain-English Caption**: Continuously explains current state (e.g., *"Bucket at 85%. Refilling at 10 tokens/sec. Each request costs 1."*).
+  * Amber Dashed Line (`GLOBAL`): Authoritative global quota reported back by Redis.
+* **Live Stats Readout**:
+  * **Local**: Tokens available in local Shield memory (decrements instantly with zero latency).
+  * **Global**: The authoritative token count returned by Redis during the last sync.
+  * **Drift**: Discrepancy between local and global ($|\text{Local} - \text{Global}|$).
+  * **Unsynced $\Delta$ (Delta)**: Consumed tokens accumulated locally, queued for the next 1-second sync.
+* **Mini Token History Chart**: Rolling 60-second line chart showing token levels over time.
+* **Dynamic Plain-English Caption**: Updates live (e.g., *"Bucket at 85%. Refilling at 10 tokens/sec. Each request costs 1."*).
 
 ---
 
@@ -858,14 +861,32 @@ Mathematically proves that the distributed rate limiter prevents quota abuse acr
 
 ---
 
-#### 8. Sync Daemon Timeline
-* **Horizontal Synchronous Tape**: A scrolling strip of sync cards ticking every 1.0 second.
-* **Card Details**:
-  * Sync Sequence ID (e.g., `#42`).
-  * $\Delta$ reported (tokens consumed locally).
-  * Authoritative global token count returned from Redis.
-  * Drift corrected during reconciliation.
-  * Connection mode badge (`LOCAL REDIS` vs `ELASTICACHE`).
+#### 8. Sync Daemon Timeline Panel
+The **Sync Daemon** runs asynchronously in the background every **1.0 second** to synchronize local edge state with central Redis / AWS ElastiCache. It renders as a scrolling horizontal timeline where each card represents one synchronization cycle:
+
+```
+┌──────────────────┐
+│ #24              │ ◄── Sync Sequence ID (increments every 1s)
+│ Δ 10             │ ◄── DELTA (Greek Triangle Δ): Tokens consumed locally since last sync
+│ G 12.4           │ ◄── GLOBAL: Authoritative tokens returned by Redis
+│ drift 0.2        │ ◄── DRIFT: Difference between local memory and central Redis
+└──────────────────┘
+```
+
+* **`#` (Sequence Number, e.g. `#24`)**: The incremental ID of the sync run. Confirms that the background daemon is healthy and ticking at 1 Hz.
+* **`Δ` (The Greek Triangle "Delta" — e.g. `Δ 10`)**: 
+  * **What it is**: The exact count of tokens consumed locally (`unsynced_delta`) by this Shield instance since the previous 1-second sync.
+  * **How it works**: When a request is allowed locally, the Shield decrements local tokens and increments `unsynced_delta += 1`. When the sync daemon wakes up, it transmits this $\Delta$ to Redis so Redis knows how much local usage to deduct from the global quota.
+* **`G` (Authoritative Global Tokens — e.g. `G 12.4`)**: 
+  * **What it is**: The single source of truth returned by Redis after executing the atomic Lua script.
+  * **How Redis calculates it**: Redis adds time-based refills ($\text{elapsed} \times \text{refill}$) to stored tokens, subtracts the reported delta $\Delta$, and returns the updated global token count $G$.
+* **`drift` (Drift Correction — e.g. `drift 0.2`)**:
+  * **What it is**: The mathematical difference between local tokens and Redis global tokens:
+    $$\text{drift} = |\text{local\_tokens} - \text{global\_tokens}|$$
+  * **Why drift occurs**: Because the Shield authorizes requests *locally in real time* without waiting on Redis network hops, local memory and Redis can drift slightly apart during the 1-second sync window.
+  * **How it converges**: The moment Redis returns $G$, the Shield immediately reconciles by setting `local_tokens = G`. This eliminates drift and locks all POPs to the true global limit.
+* **`LOCAL REDIS` vs `ELASTICACHE` Mode Badge**: Displays whether the daemon is communicating with the local containerized Redis or AWS ElastiCache.
+* **Fail-Open Status**: If Redis crashes, cards turn red with a `fail` border and a banner alerts: *"⚠ Redis unreachable — failing open, serving from local bucket"*.
 
 ---
 
