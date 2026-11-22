@@ -565,9 +565,9 @@ docker compose down -v   # stops containers and removes volumes
 
 ---
 
-## 🖥️ Live Control Room Dashboard
+## 🖥️ Live Mission Control Dashboard
 
-A real-time visual dashboard at **http://localhost:3000** that shows everything happening inside the system — designed for live demos and audience presentations.
+A cinematic, real-time sci-fi "Mission Control" dashboard at **http://localhost:3000** that visualizes everything happening across the distributed edge network — designed for projector presentations and live audience demonstrations.
 
 ### Opening the Dashboard
 
@@ -576,19 +576,30 @@ docker compose up --build     # starts all services including the dashboard
 # Then open http://localhost:3000 in your browser
 ```
 
-### Dashboard Panels
+### Dashboard Panels & Features
 
-| Panel | Description |
+| Panel / Feature | Description |
 |---|---|
-| **A. Live Topology Map** | SVG diagram of Client → CDN → POPs → Shield → Origin with animated dots. Green dots = allowed, red dots = 429 denied. Redis sync pulses in amber. AWS nodes flash on activity. |
-| **B. Token Bucket Visualizer** | Animated gauge showing local tokens vs capacity, global (Redis) marker, drift readout, and a 60-second token history chart. |
-| **C. Throughput Chart** | Rolling 60-second stacked bar chart of allowed vs denied requests per second. Big counters for total, deny%, RPS, and p50/p95 decision latency. |
-| **D. POP Distribution** | Per-POP request count with allow/deny split bars. Shows combined global line to prove limits work across POPs. |
-| **E. Live Request Feed** | Scrolling terminal-style log (latest 200 events) with pause/resume and filter by allow/deny/sync. |
-| **F. Sync Daemon Timeline** | Horizontal strip ticking every sync cycle with delta, global tokens, drift, and Redis OK/FAIL status. Shows LOCAL REDIS vs ELASTICACHE mode badge. |
-| **G. AWS Integrations** | Cards for ElastiCache, CloudWatch, SNS, S3 — each showing ENABLED/DISABLED status and last activity. |
-| **H. Control Panel** | Left sidebar with: API key/region selectors, Send 1 / Burst 30 buttons, Load test (RPS slider 1-500, duration), Live config (capacity + refill), Bucket reset, Redis kill/restore, Preset scenarios. |
-| **I. Explainer Strip** | Plain-English narration of current state updated from live data. |
+| **A. Hero Topology (~55% Viewport)** | Full-width Canvas with live particle physics. Allowed requests travel as glowing green comets; denied requests burst as vivid neon red particles with comet trails hitting the Shield, triggering shockwaves, 429 popups, and red shard bursts. Bezier links pulse with traffic. Amber pulses visualize the Redis batch sync daemon. |
+| **B. Liquid Token Bucket** | Physics-based vessel with sine-wave liquid surface, capacity tick mark, authoritative global Redis marker, falling token droplets, and live drift readout. |
+| **C. Throughput & Counters** | Rolling 60-second gradient area chart (allowed vs denied). Giant 36px+ neon JetBrains Mono odometer counters for Total, Allowed, Denied, Deny %, RPS, and p50/p95 latency in ms. |
+| **D. Global Limit Proof Card** | Evaluates actual allowed requests against the theoretical rate ($C + r \times \Delta t$) starting from first request with dynamic tolerance bands. Badges honestly display `HOLDING` or `DRIFTING`. |
+| **E. POP Distribution** | Glass cards for Mumbai, Delhi, and Bengaluru with real SVG location markers, animated allow/deny split bars, and request tallies. |
+| **F. Live Request Feed** | Terminal-style log with colored status badges (`ALLOW`, `DENY`, `SYNC`, `SNS`, `S3`), slide-in animations, and filter controls. |
+| **G. Sync Daemon Timeline** | Horizontal timeline tracking batch sync ticks: delta reported ($\Delta$), global tokens ($G$), and drift compensation. |
+| **H. Control Panel** | Left sidebar: API key & region selector, Send 1 / Burst 30, continuous load test generator (1-500 RPS slider), live capacity/refill configuration, bucket reset, Redis kill/restore, and quick presets. |
+| **I. Guided Demo Tour** | Click **▸ Guided Demo** in the header for an auto-play narrated 8-step interactive tour that spotlights panels and triggers real network events. |
+| **J. Presentation Mode** | Press <kbd>F</kbd> to hide the control sidebar and maximize topology & live counters for a projector display, with floating quick-controls. |
+| **K. Low FX Mode** | Click **FX** in the header to toggle reduced effects (disables background starfield drift, canvas particle trails, and blur for low-spec hardware). Respects `prefers-reduced-motion`. |
+
+### Keyboard Shortcuts
+
+| Shortcut | Action |
+|---|---|
+| <kbd>F</kbd> | Toggle Presentation Mode (fullscreen projector layout) |
+| <kbd>→</kbd> / <kbd>Space</kbd> | Next step in Guided Demo |
+| <kbd>←</kbd> | Previous step in Guided Demo |
+| <kbd>Esc</kbd> | Exit Guided Demo |
 
 ### Dashboard API Endpoints
 
