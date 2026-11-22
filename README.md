@@ -74,22 +74,46 @@ This project demonstrates a production-grade architecture solving all four chall
 ## 📋 Table of Contents
 
 - [Problem Statement: Why Do We Need This?](#-problem-statement-why-do-we-need-this)
+- [Quick Start](#-quick-start)
 - [Architecture Overview](#architecture-overview)
 - [AWS Cloud Services](#-aws-cloud-services)
 - [Project Structure](#-project-structure)
 - [How Each Service Works](#-how-each-service-works)
 - [Key Design Properties](#-key-design-properties)
-- [Prerequisites](#prerequisites)
-- [Quick Start](#quick-start)
-- [AWS Setup Guide](#-aws-setup-guide)
 - [Configuration Reference](#configuration-reference)
 - [Running the Load Test](#running-the-load-test)
 - [End-to-End Request Flow — Layer by Layer](#-end-to-end-request-flow--layer-by-layer)
 - [Deep Dive: In-Memory Token Bucket & Redis Synchronization](#-deep-dive-in-memory-token-bucket--redis-synchronization)
 - [Live Mission Control Dashboard — Complete Reference](#-live-mission-control-dashboard--complete-reference)
-- [Demo Walkthrough](#-demo-walkthrough)
-- [Tearing Down](#tearing-down)
 - [Tech Stack](#-tech-stack)
+
+---
+
+## 🚀 Quick Start
+
+### 1. Launch All Services (Local Docker)
+
+```bash
+docker compose up -d --build
+```
+This starts all 8 services: Nginx CDN (`:8080`), 3 Edge POPs (`:8001`, `:8002`, `:8003`), Origin Shield (`:9000`), Origin API (`:8000`), Redis (`:6379`), and the Mission Control Dashboard (`:3000`).
+
+### 2. Open Live Mission Control
+
+Open your browser to:
+👉 **[http://localhost:3000](http://localhost:3000)**
+
+From the UI, you can:
+* Fire single requests or bursts across Mumbai, Delhi, and Bengaluru POPs.
+* Trigger an automated 8-step **Guided Demo Tour** (`▸ Guided Demo`).
+* Run live load tests (up to 200 req/s) and watch the mathematical proof card confirm quota enforcement.
+* Simulate Redis outages and witness real-time fail-open recovery.
+
+### 3. Stop All Services
+
+```bash
+docker compose down -v
+```
 
 ---
 
@@ -601,120 +625,6 @@ What happens if Redis crashes or AWS ElastiCache becomes unreachable?
 
 ---
 
-## 🎬 Demo Walkthrough
-
-### Step 1 — Verify all services are healthy
-
-```powershell
-docker compose ps
-```
-
-All 7 containers should show `(healthy)`:
-- `rl-cdn` — CDN / Edge Network (Nginx)
-- `rl-redis` — Central Redis
-- `rl-origin` — Origin Server
-- `rl-shield` — Origin Shield
-- `rl-edge-mumbai` — Mumbai POP
-- `rl-edge-delhi` — Delhi POP
-- `rl-edge-bengaluru` — Bengaluru POP
-
-### Step 2 — Check CDN and Edge POP health endpoints
-
-```powershell
-# CDN health
-Invoke-RestMethod http://localhost:8080/cdn-health
-
-# Edge POP health
-Invoke-RestMethod http://localhost:8001/health    # Mumbai
-Invoke-RestMethod http://localhost:8002/health    # Delhi
-Invoke-RestMethod http://localhost:8003/health    # Bengaluru
-```
-
-### Step 3 — Test CDN routing (geographic simulation)
-
-```powershell
-# Route through Mumbai via CDN
-Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="mumbai"}
-
-# Route through Delhi via CDN
-Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="delhi"}
-
-# Round-robin (no region specified)
-Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"}
-```
-
-Check the `X-CDN-Routed-To` and `x-served-by-pop` response headers to verify routing.
-
-### Step 4 — Send normal requests (watch X-RateLimit-Remaining decrease globally)
-
-```powershell
-Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="mumbai"}
-Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="delhi"}
-Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"; "X-Region"="bengaluru"}
-```
-
-### Step 5 — Trigger 429 Rate Limit (exhaust bucket)
-
-*(Note: Because PowerShell loops are slow (~8 req/s) and the bucket refills at 10 req/s, this sequential loop may not actually exhaust the bucket depending on your computer's speed. Step 7's concurrent load test guarantees exhaustion).*
-
-```powershell
-for ($i=1; $i -le 25; $i++) {
-    try {
-        $r = Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"} -ErrorAction Stop
-        Write-Host "Req $i : HTTP $($r.StatusCode)" -ForegroundColor Green
-    } catch {
-        Write-Host "Req $i : HTTP 429 (RATE LIMITED!)" -ForegroundColor Red
-    }
-}
-```
-
-### Step 6 — Watch token refill (wait 3 seconds, then try again)
-
-```powershell
-Start-Sleep -Seconds 3
-Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:8080/products" -Headers @{"x-api-key"="demo-key"}
-# Should return HTTP 200 — tokens have refilled!
-```
-
-### Step 7 — Run the global load test
-
-```powershell
-# Via CDN (recommended — simulates real-world flow)
-python loadtest.py --cdn
-
-# Or direct to POPs (bypasses CDN)
-python loadtest.py
-```
-
-### Step 8 — Verify AWS services received data
-
-- **CloudWatch**: https://console.aws.amazon.com/cloudwatch → Log groups → `/edge-rate-limiter`
-- **SNS**: Check your email inbox for rate-limit alert notifications
-- **S3**: https://console.aws.amazon.com/s3 → `rate-limiter-audit-logs` → `audit-logs/shield/`
-
-### Step 9 — Inspect Redis state
-
-```powershell
-docker exec -it rl-redis redis-cli
-HGETALL "rl:key:demo-key"
-```
-
-### Or run the interactive demo script
-
-```powershell
-.\demo.ps1
-```
-
----
-
-## Tearing Down
-
-```bash
-docker compose down -v   # stops containers and removes volumes
-```
-
----
-
 ## 🖥️ Live Mission Control Dashboard — Complete Reference
 
 The Live Mission Control Dashboard is a standalone, real-time, zero-build web application served at **http://localhost:3000**. Designed like a sci-fi network operations center (NOC), it renders every distributed event physically and audibly without external build steps (pure modern ES modules + Canvas API + Chart.js + GSAP).
@@ -944,34 +854,16 @@ Clicking **`▸ Guided Demo`** in the header launches an automated 90-second int
 |---|---|---|
 | `DASHBOARD_ALLOW_DOCKER_CONTROL` | `false` | When set to `true` (and `/var/run/docker.sock` is mounted), enables the Kill/Restore Redis buttons in the control panel for live chaos testing. |
 
-### Demo Flow
+### Quick UI Verification Flow
 
 1. **Open dashboard** → `http://localhost:3000`
-2. **Watch the topology** at idle — all health dots green, no traffic
-3. **Click "Send 1"** → watch a green dot travel Client → CDN → POP → Shield → Origin
-4. **Click "Burst 30"** → watch the bucket drain and red 429 dots appear
-5. **Start a load test** (100 rps, 10s) → watch throughput chart fill, denial rate climb, global limit hold across all 3 POPs
-6. **Stop Redis** → watch the Redis health dot turn red, "failing open" banner appear, and the system continue serving from local bucket
-7. **Restore Redis** → watch it recover, sync resume, drift correct
-8. **Adjust config** → change capacity to 50, watch the bucket refill and allow rate increase
-
-### Smoke Test
-
-```bash
-python tests/test_smoke.py
-```
-
----
-
-## Verifying Python Syntax
-
-```bash
-python -m py_compile origin/main.py
-python -m py_compile edge/main.py
-python -m py_compile shield/main.py
-python -m py_compile loadtest.py
-echo "All files pass py_compile"
-```
+2. **Watch the topology** at idle — all health dots green, ambient particles drifting along links
+3. **Click "Send 1"** → watch a green comet particle travel Client → CDN → POP → Shield → Origin
+4. **Click "Burst 30"** → watch the bucket drain, triggering 429 shockwaves and red spark bursts at the Shield
+5. **Start a load test** (100 rps, 10s) → watch the live throughput area chart fill and the Global Limit Proof card verify enforcement
+6. **Stop Redis** → watch the Redis node gray out and the system seamlessly fail open
+7. **Restore Redis** → watch it self-heal, the Sync Daemon resume ticking, and drift converge to zero
+8. **Live Config** → adjust capacity and refill rates on the fly to see immediate bucket responses
 
 ---
 
