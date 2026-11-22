@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Control Room — Edge Rate Limiter</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+</head>
+<body>
+<div id="app">
+
+  <!-- ═══════ I. EXPLAINER STRIP ═══════ -->
+  <header id="explainer">
+    <span class="pulse-dot green"></span>
+    <span id="explainer-text">Waiting for data…</span>
+    <span class="badge" id="connection-badge">connecting</span>
+  </header>
+
+  <div class="layout">
+
+    <!-- ═══════ H. CONTROL PANEL ═══════ -->
+    <aside id="control-panel">
+      <h2>⚙ Control Panel</h2>
+
+      <label>API Key
+        <input type="text" id="ctl-apikey" value="demo-key" spellcheck="false">
+      </label>
+
+      <label>Region
+        <select id="ctl-region">
+          <option value="">Round-Robin</option>
+          <option value="mumbai">Mumbai</option>
+          <option value="delhi">Delhi</option>
+          <option value="bengaluru">Bengaluru</option>
+          <option value="mixed">Mixed (rotate)</option>
+        </select>
+      </label>
+
+      <div class="btn-row">
+        <button id="btn-fire" class="btn green">▸ Send 1</button>
+        <button id="btn-burst" class="btn amber">⚡ Burst 30</button>
+      </div>
+
+      <fieldset>
+        <legend>Load Test</legend>
+        <label>RPS <input type="range" id="ctl-rps" min="1" max="500" value="100"><span id="ctl-rps-val" style="float:right;font-family:var(--mono);color:var(--text)">100</span></label>
+        <label>Duration (s) <input type="range" id="ctl-duration" min="1" max="60" value="10"><span id="ctl-duration-val" style="float:right;font-family:var(--mono);color:var(--text)">10</span></label>
+        <div class="btn-row">
+          <button id="btn-load-start" class="btn green">▶ Start</button>
+          <button id="btn-load-stop" class="btn red" disabled>■ Stop</button>
+        </div>
+        <div id="load-status" class="mini-status"></div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Bucket Config</legend>
+        <label>Capacity <input type="number" id="ctl-capacity" value="20" min="1" max="1000" step="1"></label>
+        <label>Refill/sec <input type="number" id="ctl-refill" value="10" min="1" max="500" step="1"></label>
+        <button id="btn-config" class="btn blue">Apply Config</button>
+      </fieldset>
+
+      <fieldset>
+        <legend>Bucket Reset</legend>
+        <label>Client <select id="ctl-reset-client"></select></label>
+        <button id="btn-reset" class="btn amber">Reset Bucket</button>
+      </fieldset>
+
+      <fieldset>
+        <legend>Redis Control</legend>
+        <div id="redis-control-area">
+          <div class="btn-row">
+            <button id="btn-redis-stop" class="btn red">Kill Redis</button>
+            <button id="btn-redis-start" class="btn green">Restore</button>
+          </div>
+        </div>
+        <div id="redis-manual-cmd" class="mini-status" style="display:none">
+          Run manually:<br>
+          <code>docker stop rl-redis</code><br>
+          <code>docker start rl-redis</code>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Presets</legend>
+        <button class="btn preset" data-preset="normal">📊 Normal Traffic (10 rps)</button>
+        <button class="btn preset" data-preset="burst">🔥 Burst Attack (300 rps)</button>
+        <button class="btn preset" data-preset="multikey">👥 Multi-Key (5 keys)</button>
+        <button class="btn preset" data-preset="redis-outage">💀 Redis Outage</button>
+      </fieldset>
+    </aside>
+
+    <!-- ═══════ MAIN CONTENT ═══════ -->
+    <main class="content">
+
+      <!-- A. TOPOLOGY MAP -->
+      <section id="topology-panel" class="panel">
+        <h3>Live Topology <span class="help" title="Animated dots show requests flowing: green=allowed, red=429. Lines glow with traffic. Amber pulses = Redis sync.">?</span></h3>
+        <svg id="topology-svg" viewBox="0 0 920 330" preserveAspectRatio="xMidYMid meet">
+          <defs>
+            <filter id="glow">
+              <feGaussianBlur stdDeviation="2" result="blur"/>
+              <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+            </filter>
+            <linearGradient id="linkGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+              <stop offset="0%" stop-color="#334155"/>
+              <stop offset="100%" stop-color="#475569"/>
+            </linearGradient>
+          </defs>
+
+          <!-- Links -->
+          <g id="topo-links" stroke="#2d3a4f" stroke-width="1.5" fill="none" opacity="0.7">
+            <line x1="80" y1="150" x2="160" y2="150"/>
+            <line id="link-cdn-mum" x1="230" y1="150" x2="320" y2="60"/>
+            <line id="link-cdn-del" x1="230" y1="150" x2="320" y2="150"/>
+            <line id="link-cdn-blr" x1="230" y1="150" x2="320" y2="240"/>
+            <line id="link-mum-sh" x1="400" y1="60" x2="480" y2="150"/>
+            <line id="link-del-sh" x1="400" y1="150" x2="480" y2="150"/>
+            <line id="link-blr-sh" x1="400" y1="240" x2="480" y2="150"/>
+            <line id="link-sh-ori" x1="560" y1="150" x2="640" y2="150"/>
+            <line id="link-sh-redis" x1="520" y1="180" x2="520" y2="252" stroke="#f59e0b" stroke-dasharray="5 3" opacity="0.5"/>
+            <line id="link-sh-cw"  x1="560" y1="140" x2="740" y2="55"  stroke="#448aff" stroke-dasharray="3 3" opacity="0.3"/>
+            <line id="link-sh-sns" x1="560" y1="155" x2="740" y2="155" stroke="#448aff" stroke-dasharray="3 3" opacity="0.3"/>
+            <line id="link-sh-s3"  x1="560" y1="170" x2="740" y2="255" stroke="#448aff" stroke-dasharray="3 3" opacity="0.3"/>
+          </g>
+          <g id="topo-dots"></g>
+
+          <!-- Client -->
+          <g class="topo-node" transform="translate(25,125)">
+            <rect width="80" height="50" rx="10" class="n-bg n-client"/>
+            <text x="40" y="20" class="n-label">👤 Clients</text>
+            <text x="40" y="38" class="n-ctr" id="ctr-client">0 rps</text>
+          </g>
+          <!-- CDN -->
+          <g class="topo-node" transform="translate(155,125)">
+            <rect width="80" height="50" rx="10" class="n-bg n-cdn"/>
+            <text x="40" y="20" class="n-label">🌐 CDN</text>
+            <text x="40" y="38" class="n-ctr" id="ctr-cdn">0 rps</text>
+            <circle cx="68" cy="8" r="4" class="h-dot" id="h-cdn"/>
+          </g>
+          <!-- Mumbai -->
+          <g class="topo-node" transform="translate(310,35)">
+            <rect width="95" height="50" rx="10" class="n-bg n-pop"/>
+            <text x="47" y="20" class="n-label">🏙 Mumbai</text>
+            <text x="47" y="38" class="n-ctr" id="ctr-mumbai">0</text>
+            <circle cx="83" cy="8" r="4" class="h-dot" id="h-mumbai"/>
+          </g>
+          <!-- Delhi -->
+          <g class="topo-node" transform="translate(310,125)">
+            <rect width="95" height="50" rx="10" class="n-bg n-pop"/>
+            <text x="47" y="20" class="n-label">🏛 Delhi</text>
+            <text x="47" y="38" class="n-ctr" id="ctr-delhi">0</text>
+            <circle cx="83" cy="8" r="4" class="h-dot" id="h-delhi"/>
+          </g>
+          <!-- Bengaluru -->
+          <g class="topo-node" transform="translate(310,215)">
+            <rect width="95" height="50" rx="10" class="n-bg n-pop"/>
+            <text x="47" y="20" class="n-label">🌴 Bengaluru</text>
+            <text x="47" y="38" class="n-ctr" id="ctr-bengaluru">0</text>
+            <circle cx="83" cy="8" r="4" class="h-dot" id="h-bengaluru"/>
+          </g>
+          <!-- Shield -->
+          <g class="topo-node" transform="translate(475,120)">
+            <rect width="90" height="60" rx="10" class="n-bg n-shield"/>
+            <text x="45" y="22" class="n-label">🛡 Shield</text>
+            <text x="45" y="42" class="n-ctr" id="ctr-shield">0</text>
+            <circle cx="78" cy="8" r="4" class="h-dot" id="h-shield"/>
+          </g>
+          <!-- Origin -->
+          <g class="topo-node" transform="translate(635,125)">
+            <rect width="80" height="50" rx="10" class="n-bg n-origin"/>
+            <text x="40" y="20" class="n-label">📦 Origin</text>
+            <text x="40" y="38" class="n-ctr" id="ctr-origin">0</text>
+            <circle cx="68" cy="8" r="4" class="h-dot" id="h-origin"/>
+          </g>
+          <!-- Redis -->
+          <g class="topo-node" transform="translate(475,255)">
+            <rect width="90" height="42" rx="10" class="n-bg n-redis"/>
+            <text x="45" y="18" class="n-label">🗄 Redis</text>
+            <text x="45" y="34" class="n-sub" id="redis-topo-st">OK</text>
+            <circle cx="78" cy="7" r="4" class="h-dot" id="h-redis"/>
+          </g>
+          <!-- CloudWatch -->
+          <g class="topo-node" transform="translate(735,30)">
+            <rect width="105" height="45" rx="10" class="n-bg n-aws"/>
+            <text x="52" y="17" class="n-label">☁ CloudWatch</text>
+            <text x="52" y="35" class="n-sub" id="cw-topo">active</text>
+          </g>
+          <!-- SNS -->
+          <g class="topo-node" transform="translate(735,130)">
+            <rect width="105" height="45" rx="10" class="n-bg n-aws"/>
+            <text x="52" y="17" class="n-label">📢 SNS</text>
+            <text x="52" y="35" class="n-sub" id="sns-topo">—</text>
+          </g>
+          <!-- S3 -->
+          <g class="topo-node" transform="translate(735,230)">
+            <rect width="105" height="45" rx="10" class="n-bg n-aws"/>
+            <text x="52" y="17" class="n-label">📦 S3</text>
+            <text x="52" y="35" class="n-sub" id="s3-topo">—</text>
+          </g>
+
+          <text x="520" y="246" class="sync-label" id="sync-label">sync #0</text>
+        </svg>
+      </section>
+
+      <!-- MIDDLE ROW -->
+      <div class="mid-row">
+        <!-- B. TOKEN BUCKET -->
+        <section id="bucket-panel" class="panel">
+          <h3>Token Bucket <span class="help" title="Visual gauge: green fill = local tokens, amber marker = last global (Redis) value. Drift = local - global difference.">?</span></h3>
+          <select id="bucket-client-select"><option value="">Select client…</option></select>
+          <div class="bucket-vis">
+            <div class="bucket-gauge">
+              <div class="bucket-fill" id="bucket-fill"></div>
+              <div class="bucket-global-mark" id="bucket-global"></div>
+              <span class="bucket-label" id="bucket-label">— / —</span>
+            </div>
+            <div class="bucket-stats">
+              <div>Local: <strong id="bucket-local">—</strong></div>
+              <div>Global: <strong id="bucket-global-val">—</strong></div>
+              <div>Drift: <strong id="bucket-drift">—</strong></div>
+              <div>Unsynced Δ: <strong id="bucket-delta">—</strong></div>
+            </div>
+          </div>
+          <div class="chart-container">
+            <canvas id="bucket-chart" height="100"></canvas>
+          </div>
+        </section>
+
+        <!-- C. THROUGHPUT -->
+        <section id="throughput-panel" class="panel">
+          <h3>Throughput <span class="help" title="Rolling 60s chart of allowed (200) vs denied (429) requests per second. Big counters show totals.">?</span></h3>
+          <div class="big-counters">
+            <div class="bc"><span class="bc-num" id="bc-total">0</span><span class="bc-lbl">Total</span></div>
+            <div class="bc green"><span class="bc-num" id="bc-allow">0</span><span class="bc-lbl">Allowed</span></div>
+            <div class="bc red"><span class="bc-num" id="bc-deny">0</span><span class="bc-lbl">Denied</span></div>
+            <div class="bc amber"><span class="bc-num" id="bc-pct">0%</span><span class="bc-lbl">Deny %</span></div>
+            <div class="bc"><span class="bc-num" id="bc-rps">0</span><span class="bc-lbl">RPS</span></div>
+            <div class="bc blue"><span class="bc-num" id="bc-p50">0</span><span class="bc-lbl">p50 ms</span></div>
+            <div class="bc blue"><span class="bc-num" id="bc-p95">0</span><span class="bc-lbl">p95 ms</span></div>
+          </div>
+          <div class="chart-container">
+            <canvas id="throughput-chart" height="140"></canvas>
+          </div>
+        </section>
+
+        <!-- D. POP DISTRIBUTION -->
+        <section id="pop-panel" class="panel">
+          <h3>POP Distribution <span class="help" title="Per-POP request count with allow/deny bars. Proves the global rate limit works across all 3 POPs.">?</span></h3>
+          <div id="pop-cards">
+            <div class="pop-card" data-pop="mumbai"><h4>🏙 Mumbai</h4><div class="pop-bar"><div class="pop-ok"></div><div class="pop-deny"></div></div><span class="pop-nums">—</span></div>
+            <div class="pop-card" data-pop="delhi"><h4>🏛 Delhi</h4><div class="pop-bar"><div class="pop-ok"></div><div class="pop-deny"></div></div><span class="pop-nums">—</span></div>
+            <div class="pop-card" data-pop="bengaluru"><h4>🌴 Bengaluru</h4><div class="pop-bar"><div class="pop-ok"></div><div class="pop-deny"></div></div><span class="pop-nums">—</span></div>
+          </div>
+          <div id="pop-global-line" class="mini-status"></div>
+        </section>
+      </div>
+
+      <!-- BOTTOM ROW -->
+      <div class="bot-row">
+        <!-- E. REQUEST FEED -->
+        <section id="feed-panel" class="panel">
+          <h3>Live Feed
+            <span class="feed-controls">
+              <button id="feed-pause" class="btn-sm">⏸</button>
+              <select id="feed-filter">
+                <option value="all">All</option>
+                <option value="allow">Allow</option>
+                <option value="deny">Deny</option>
+                <option value="sync">Sync / AWS</option>
+              </select>
+            </span>
+          </h3>
+          <div id="feed" class="feed-scroll"></div>
+        </section>
+
+        <!-- F. SYNC TIMELINE -->
+        <section id="sync-panel" class="panel">
+          <h3>Sync Daemon <span class="help" title="Each tick = one batch sync cycle. Shows delta sent to Redis, global tokens back, drift corrected.">?</span></h3>
+          <div class="sync-mode-badge" id="sync-mode">LOCAL REDIS</div>
+          <div id="sync-banner" class="sync-banner hidden">⚠ Redis unreachable — failing open, serving from local bucket</div>
+          <div id="sync-timeline" class="sync-scroll"></div>
+        </section>
+      </div>
+
+    </main>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

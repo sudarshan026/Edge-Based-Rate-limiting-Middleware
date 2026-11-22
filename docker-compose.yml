@@ -45,7 +45,7 @@ services:
       timeout: 3s
       retries: 10
       start_period: 10s
-      test: ["CMD", "wget", "-qO-", "http://localhost:80/cdn-health"]
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:80/cdn-health"]
     networks:
       - rl-net
     depends_on:
@@ -118,14 +118,15 @@ services:
         required: false
     volumes:
       - ./shield/main.py:/app/main.py:ro
+      - ./shield/event_bus.py:/app/event_bus.py:ro
     command: uvicorn main:app --host 0.0.0.0 --port 9000 --log-level info
     environment:
       PYTHONUNBUFFERED: "1"
       ORIGIN_URL: http://origin:8000
       # Local Redis fallback — overridden by ELASTICACHE_URL from .env
       REDIS_URL: redis://redis:6379
-      # AWS services — loaded from .env; empty = feature disabled
-      ELASTICACHE_URL: ${ELASTICACHE_URL:-}
+      # Force local Redis container for local demo (set to ${ELASTICACHE_URL:-} to use AWS ElastiCache)
+      ELASTICACHE_URL: ""
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
       AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-ap-southeast-2}
@@ -257,6 +258,40 @@ services:
       - rl-net
     depends_on:
       shield:
+        condition: service_healthy
+
+  # --------------------------------------------------------------------------
+  # Control Room Dashboard (port 3000)
+  # --------------------------------------------------------------------------
+  dashboard:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    platform: linux/amd64
+    container_name: rl-dashboard
+    volumes:
+      - ./dashboard/main.py:/app/main.py:ro
+      - ./dashboard/static:/app/static:ro
+    command: uvicorn main:app --host 0.0.0.0 --port 3000 --log-level info
+    environment:
+      PYTHONUNBUFFERED: "1"
+      SHIELD_URL: http://shield:9000
+      CDN_URL: http://cdn:80
+      DASHBOARD_ALLOW_DOCKER_CONTROL: ${DASHBOARD_ALLOW_DOCKER_CONTROL:-false}
+    ports:
+      - "3000:3000"
+    healthcheck:
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/api/health"]
+    networks:
+      - rl-net
+    depends_on:
+      shield:
+        condition: service_healthy
+      cdn:
         condition: service_healthy
 
 # ---------------------------------------------------------------------------

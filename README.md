@@ -131,9 +131,11 @@ This project integrates **4 AWS cloud services** for production-grade observabil
 │                              #   request forwarding, CloudWatch log handler
 │
 ├── shield/
-│   └── main.py               # Origin Shield — in-memory token bucket, rate limiting,
-│                              #   Batch Sync Daemon (Redis/ElastiCache), SNS alerts,
-│                              #   S3 audit log flushing, CloudWatch logging
+│   ├── main.py               # Origin Shield — in-memory token bucket, rate limiting,
+│   │                          #   Batch Sync Daemon (Redis/ElastiCache), SNS alerts,
+│   │                          #   S3 audit log flushing, CloudWatch logging,
+│   │                          #   event bus + /internal/* endpoints for dashboard
+│   └── event_bus.py           # Async event bus with bounded per-subscriber queues
 │
 ├── origin/
 │   └── main.py               # Origin Server — simulates a dynamic API with
@@ -142,6 +144,17 @@ This project integrates **4 AWS cloud services** for production-grade observabil
 ├── loadtest.py               # Load testing script (200 req/s × 10s, CDN or direct mode)
 ├── demo.ps1                  # Interactive PowerShell demo script
 ├── commands.md               # Quick-reference demo commands
+│
+├── dashboard/
+│   ├── main.py               # Control Room backend — SSE proxy, load generator,
+│   │                          #   health aggregator, Docker control
+│   └── static/
+│       ├── index.html         # Single-page dark-themed dashboard UI
+│       ├── style.css          # Dark theme, animations, responsive layout
+│       └── app.js             # SSE connection, topology animation, charts, controls
+│
+├── tests/
+│   └── test_smoke.py          # Smoke test: burst + SSE event verification
 │
 └── docs/                     # Screenshots and demo recordings
     ├── health-endpoints.webp  # Edge POP health checks
@@ -548,6 +561,73 @@ HGETALL "rl:key:demo-key"
 
 ```bash
 docker compose down -v   # stops containers and removes volumes
+```
+
+---
+
+## 🖥️ Live Control Room Dashboard
+
+A real-time visual dashboard at **http://localhost:3000** that shows everything happening inside the system — designed for live demos and audience presentations.
+
+### Opening the Dashboard
+
+```bash
+docker compose up --build     # starts all services including the dashboard
+# Then open http://localhost:3000 in your browser
+```
+
+### Dashboard Panels
+
+| Panel | Description |
+|---|---|
+| **A. Live Topology Map** | SVG diagram of Client → CDN → POPs → Shield → Origin with animated dots. Green dots = allowed, red dots = 429 denied. Redis sync pulses in amber. AWS nodes flash on activity. |
+| **B. Token Bucket Visualizer** | Animated gauge showing local tokens vs capacity, global (Redis) marker, drift readout, and a 60-second token history chart. |
+| **C. Throughput Chart** | Rolling 60-second stacked bar chart of allowed vs denied requests per second. Big counters for total, deny%, RPS, and p50/p95 decision latency. |
+| **D. POP Distribution** | Per-POP request count with allow/deny split bars. Shows combined global line to prove limits work across POPs. |
+| **E. Live Request Feed** | Scrolling terminal-style log (latest 200 events) with pause/resume and filter by allow/deny/sync. |
+| **F. Sync Daemon Timeline** | Horizontal strip ticking every sync cycle with delta, global tokens, drift, and Redis OK/FAIL status. Shows LOCAL REDIS vs ELASTICACHE mode badge. |
+| **G. AWS Integrations** | Cards for ElastiCache, CloudWatch, SNS, S3 — each showing ENABLED/DISABLED status and last activity. |
+| **H. Control Panel** | Left sidebar with: API key/region selectors, Send 1 / Burst 30 buttons, Load test (RPS slider 1-500, duration), Live config (capacity + refill), Bucket reset, Redis kill/restore, Preset scenarios. |
+| **I. Explainer Strip** | Plain-English narration of current state updated from live data. |
+
+### Dashboard API Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/api/stream` | SSE stream (proxied from shield) |
+| `GET` | `/api/state` | JSON state snapshot (proxied from shield) |
+| `POST` | `/api/fire` | Send 1 request through CDN |
+| `POST` | `/api/burst` | Send N requests through CDN |
+| `POST` | `/api/load/start` | Start continuous load test |
+| `POST` | `/api/load/stop` | Stop load test |
+| `GET` | `/api/load/status` | Load test progress |
+| `POST` | `/api/config` | Live-adjust capacity/refill |
+| `POST` | `/api/reset` | Reset a client bucket |
+| `GET` | `/api/health` | Aggregated health of all services |
+| `POST` | `/api/docker/redis/stop` | Stop Redis (requires `DASHBOARD_ALLOW_DOCKER_CONTROL=true`) |
+| `POST` | `/api/docker/redis/start` | Start Redis (requires `DASHBOARD_ALLOW_DOCKER_CONTROL=true`) |
+
+### New Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `DASHBOARD_ALLOW_DOCKER_CONTROL` | `false` | Enable Kill/Restore Redis buttons. Requires Docker socket mount. |
+
+### Demo Flow
+
+1. **Open dashboard** → `http://localhost:3000`
+2. **Watch the topology** at idle — all health dots green, no traffic
+3. **Click "Send 1"** → watch a green dot travel Client → CDN → POP → Shield → Origin
+4. **Click "Burst 30"** → watch the bucket drain and red 429 dots appear
+5. **Start a load test** (100 rps, 10s) → watch throughput chart fill, denial rate climb, global limit hold across all 3 POPs
+6. **Stop Redis** → watch the Redis health dot turn red, "failing open" banner appear, and the system continue serving from local bucket
+7. **Restore Redis** → watch it recover, sync resume, drift correct
+8. **Adjust config** → change capacity to 50, watch the bucket refill and allow rate increase
+
+### Smoke Test
+
+```bash
+python tests/test_smoke.py
 ```
 
 ---

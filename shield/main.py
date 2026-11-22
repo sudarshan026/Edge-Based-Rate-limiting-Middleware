@@ -48,12 +48,15 @@ import math
 import os
 import time
 from contextlib import asynccontextmanager
+from collections import deque
 from dataclasses import dataclass, field
 
 import httpx
 import redis.asyncio as aioredis
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
+
+from event_bus import EventBus
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -142,6 +145,8 @@ class Bucket:
     last_refill: float = field(init=False)
     # Tokens consumed since the last Redis sync (the "delta" we'll report)
     unsynced_delta: float = field(default=0.0)
+    # Last authoritative global token count from Redis (dashboard display)
+    last_global_tokens: float = field(default=-1.0)
     # Protect concurrent access within this event loop
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -178,6 +183,7 @@ class Bucket:
         the delta and now will be in the NEXT sync cycle.
         """
         async with self.lock:
+            self.last_global_tokens = global_tokens
             self.tokens = min(self.capacity, max(0.0, global_tokens))
 
 
@@ -196,6 +202,18 @@ _s3_flush_task: asyncio.Task | None = None  # type: ignore[type-arg]
 # Audit log buffer — flushed to S3 every S3_FLUSH_INTERVAL seconds
 _audit_log_buffer: list[dict] = []
 _audit_log_lock = asyncio.Lock()
+
+# ---------------------------------------------------------------------------
+# Event bus & dashboard counters (zero overhead without subscribers)
+# ---------------------------------------------------------------------------
+_event_bus = EventBus()
+_total_allowed: int = 0
+_total_denied: int = 0
+_pop_allowed: dict[str, int] = {}
+_pop_denied: dict[str, int] = {}
+_sync_count: int = 0
+_last_redis_ok: bool = True
+_decision_latencies: deque[float] = deque(maxlen=1000)
 
 
 def _get_redis() -> aioredis.Redis:
@@ -296,8 +314,14 @@ async def _publish_sns_alert(client_id: str, pop: str, retry_after: int) -> None
         logger.info(
             "✅ SNS alert published  client_id=%s  pop=%s", client_id, pop
         )
+        _event_bus.publish("sns_published", {
+            "client_id": client_id, "pop": pop, "ok": True,
+        })
     except Exception as exc:  # noqa: BLE001
         logger.warning("SNS publish failed: %s", exc)
+        _event_bus.publish("sns_published", {
+            "client_id": client_id, "pop": pop, "ok": False,
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -353,11 +377,17 @@ async def _s3_audit_flush_daemon() -> None:
             logger.info(
                 "✅ S3 audit flush  records=%d  key=%s", len(batch), s3_key
             )
+            _event_bus.publish("s3_flush", {
+                "records": len(batch), "key": s3_key, "ok": True,
+            })
         except Exception as exc:  # noqa: BLE001
             # Re-queue the batch so records aren't lost
             async with _audit_log_lock:
                 _audit_log_buffer[:0] = batch
             logger.warning("S3 audit flush failed: %s — records re-queued", exc)
+            _event_bus.publish("s3_flush", {
+                "records": len(batch), "key": "", "ok": False,
+            })
 
 
 async def _append_audit(entry: dict) -> None:
@@ -380,6 +410,8 @@ async def _batch_sync_daemon() -> None:
       3. Reconcile the local bucket (drift compensation).
       4. On any Redis error: log, skip that client, retry next cycle (fail-open).
     """
+    global _last_redis_ok, _sync_count
+
     logger.info(
         "Batch sync daemon started  interval=%.1fs  capacity=%g  refill=%g/s"
         "  store=%s",
@@ -393,6 +425,7 @@ async def _batch_sync_daemon() -> None:
 
     while True:
         await asyncio.sleep(SYNC_INTERVAL)
+        _sync_count += 1
 
         # Snapshot the current client set (avoid holding the global lock during I/O)
         async with _buckets_lock:
@@ -450,11 +483,22 @@ async def _batch_sync_daemon() -> None:
                     )
 
                 global_tokens = float(result)
+                local_before = bucket.tokens
                 logger.debug(
                     "sync  client=%s  delta=%.1f  global_tokens=%.2f",
                     client_id, delta, global_tokens,
                 )
                 await bucket.reconcile(global_tokens)
+                _event_bus.publish("sync_cycle", {
+                    "client_id": client_id,
+                    "delta_reported": delta,
+                    "local_tokens_before": round(local_before, 2),
+                    "global_tokens": round(global_tokens, 2),
+                    "local_tokens_after": round(bucket.tokens, 2),
+                    "drift": round(abs(local_before - global_tokens), 2),
+                    "redis_ok": True,
+                })
+                _last_redis_ok = True
 
             except Exception as exc:  # noqa: BLE001
                 # Fail open: restore the delta so it's included in the next cycle
@@ -464,6 +508,12 @@ async def _batch_sync_daemon() -> None:
                     "Redis sync failed for client=%s: %s — failing open",
                     client_id, exc,
                 )
+                _event_bus.publish("redis_status", {
+                    "ok": False,
+                    "mode": "elasticache" if USING_ELASTICACHE else "local-redis",
+                    "error": str(exc),
+                })
+                _last_redis_ok = False
 
 
 # ---------------------------------------------------------------------------
@@ -581,6 +631,132 @@ async def health():
 
 
 # ---------------------------------------------------------------------------
+# Internal endpoints (dashboard support — not exposed through CDN)
+# ---------------------------------------------------------------------------
+@app.get("/internal/events")
+async def internal_events():
+    """SSE stream of all shield events for the dashboard."""
+    sub_id, queue = _event_bus.subscribe()
+
+    async def _generate():
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+        except asyncio.CancelledError:
+            pass
+        finally:
+            _event_bus.unsubscribe(sub_id)
+
+    return StreamingResponse(
+        _generate(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/internal/state")
+async def internal_state():
+    """JSON snapshot of all shield state for the dashboard."""
+    buckets_info = []
+    async with _buckets_lock:
+        for cid, b in _buckets.items():
+            buckets_info.append({
+                "client_id": cid,
+                "local_tokens": round(b.tokens, 2),
+                "capacity": b.capacity,
+                "refill_rate": b.refill_per_sec,
+                "last_global_tokens": round(b.last_global_tokens, 2),
+                "unsynced_delta": round(b.unsynced_delta, 2),
+            })
+
+    lats = sorted(_decision_latencies) if _decision_latencies else []
+    p50 = lats[len(lats) // 2] if lats else 0.0
+    p95 = lats[int(len(lats) * 0.95)] if lats else 0.0
+
+    async with _audit_log_lock:
+        s3_buf = len(_audit_log_buffer)
+
+    return {
+        "buckets": buckets_info,
+        "config": {
+            "bucket_capacity": BUCKET_CAPACITY,
+            "refill_per_sec": REFILL_PER_SEC,
+            "sync_interval": SYNC_INTERVAL,
+        },
+        "aws": {
+            "elasticache": {"enabled": USING_ELASTICACHE},
+            "cloudwatch": {"enabled": bool(CLOUDWATCH_LOG_GROUP), "log_group": CLOUDWATCH_LOG_GROUP or None},
+            "sns": {"enabled": bool(SNS_TOPIC_ARN)},
+            "s3": {"enabled": bool(S3_AUDIT_BUCKET), "buffer_size": s3_buf},
+        },
+        "counters": {
+            "total_allowed": _total_allowed,
+            "total_denied": _total_denied,
+            "pop_allowed": dict(_pop_allowed),
+            "pop_denied": dict(_pop_denied),
+            "sync_count": _sync_count,
+            "p50_latency_ms": round(p50, 3),
+            "p95_latency_ms": round(p95, 3),
+        },
+        "redis_ok": _last_redis_ok,
+        "subscriber_count": _event_bus.subscriber_count,
+    }
+
+
+@app.post("/internal/reset")
+async def internal_reset(request: Request):
+    """Reset a client's token bucket locally and in Redis."""
+    client_id = request.query_params.get("client_id")
+    if not client_id:
+        return JSONResponse(status_code=400, content={"error": "client_id required"})
+
+    async with _buckets_lock:
+        if client_id in _buckets:
+            bucket = _buckets[client_id]
+            async with bucket.lock:
+                bucket.tokens = bucket.capacity
+                bucket.unsynced_delta = 0.0
+                bucket.last_global_tokens = -1.0
+
+    try:
+        await _get_redis().delete(f"rl:{client_id}")
+    except Exception:  # noqa: BLE001
+        pass
+
+    return {"status": "reset", "client_id": client_id}
+
+
+@app.post("/internal/config")
+async def internal_config(request: Request):
+    """Live-adjust BUCKET_CAPACITY and REFILL_PER_SEC for demo purposes."""
+    global BUCKET_CAPACITY, REFILL_PER_SEC
+    body = await request.json()
+
+    if "capacity" in body:
+        BUCKET_CAPACITY = float(body["capacity"])
+    if "refill_per_sec" in body:
+        REFILL_PER_SEC = float(body["refill_per_sec"])
+
+    async with _buckets_lock:
+        for bucket in _buckets.values():
+            async with bucket.lock:
+                bucket.capacity = BUCKET_CAPACITY
+                bucket.refill_per_sec = REFILL_PER_SEC
+                bucket.tokens = min(bucket.tokens, BUCKET_CAPACITY)
+
+    _event_bus.publish("config_changed", {
+        "capacity": BUCKET_CAPACITY,
+        "refill_per_sec": REFILL_PER_SEC,
+    })
+
+    return {"capacity": BUCKET_CAPACITY, "refill_per_sec": REFILL_PER_SEC}
+
+
+# ---------------------------------------------------------------------------
 # Main proxy + rate-limiting route
 # ---------------------------------------------------------------------------
 @app.api_route(
@@ -591,8 +767,30 @@ async def shield_proxy(path: str, request: Request):
     client_id: str = request.headers.get("x-client-id", "unknown")
     pop: str = request.headers.get("x-pop", "unknown")
 
+    t0 = time.monotonic()
     bucket = await _get_or_create_bucket(client_id)
     allowed = await bucket.consume()
+    decision_ms = (time.monotonic() - t0) * 1000.0
+
+    # --- Dashboard counters (simple increments, negligible overhead) ---
+    global _total_allowed, _total_denied
+    if allowed:
+        _total_allowed += 1
+        _pop_allowed[pop] = _pop_allowed.get(pop, 0) + 1
+    else:
+        _total_denied += 1
+        _pop_denied[pop] = _pop_denied.get(pop, 0) + 1
+    _decision_latencies.append(decision_ms)
+
+    # --- Event bus (fire-and-forget, no-op without subscribers) ---
+    _event_bus.publish("request_decision", {
+        "client_id": client_id,
+        "pop": pop,
+        "decision": "allow" if allowed else "deny",
+        "tokens_remaining": round(max(0.0, bucket.tokens), 2),
+        "retry_after": None if allowed else math.ceil(1.0 / REFILL_PER_SEC),
+        "latency_ms": round(decision_ms, 3),
+    })
 
     if not allowed:
         # How long until 1 token refills (ceiling to next whole second)
