@@ -45,9 +45,12 @@ CDN / Edge Network  (Nginx reverse proxy — host:8080)
 - [AWS Setup Guide](#-aws-setup-guide)
 - [Configuration Reference](#configuration-reference)
 - [Running the Load Test](#running-the-load-test)
-- [Request Flow — Step by Step](#request-flow--step-by-step)
+- [End-to-End Request Flow — Layer by Layer](#-end-to-end-request-flow--layer-by-layer)
+- [Deep Dive: In-Memory Token Bucket & Redis Synchronization](#-deep-dive-in-memory-token-bucket--redis-synchronization)
+- [Live Mission Control Dashboard — Complete Reference](#-live-mission-control-dashboard--complete-reference)
 - [Demo Walkthrough](#-demo-walkthrough)
 - [Tearing Down](#tearing-down)
+- [Tech Stack](#-tech-stack)
 
 ---
 
@@ -387,67 +390,168 @@ Sends 200 req/s through the CDN entry point (port 8080) with rotating `X-Region`
 
 ---
 
-## Request Flow — Step by Step
+## 🔄 End-to-End Request Flow — Layer by Layer
+
+When a client initiates a request, it traverses a 5-layer pipeline designed for sub-millisecond local authorization, global convergence, and comprehensive AWS telemetry:
 
 ```
-1. Client sends:
-   GET /products  HTTP/1.1
-   Host: localhost:8080
-   x-api-key: my-client
-   X-Region: mumbai
-
-2. CDN / Edge Network (Nginx on :8080) receives request
-   • Reads X-Region header → "mumbai"
-   • Routes to upstream edge-mumbai (port 8001)
-   • (If no X-Region header → round-robin across all 3 POPs)
-   • Adds X-CDN-Routed-To: mumbai response header
-
-3. Edge POP (Mumbai) receives request on :8001
-   • Extracts identity: client_id = "key:my-client"
-   • Adds headers:  x-client-id: key:my-client
-                    x-pop: mumbai
-   • Forwards to Shield at http://shield:9000/products
-   • Logs to AWS CloudWatch (stream: edge-mumbai)
-
-4. Origin Shield receives forwarded request
-   • Looks up (or creates) in-memory token bucket for "key:my-client"
-   • Refills bucket based on time elapsed since last consume()
-   • Tries to consume 1 token (LOCAL, zero-latency decision):
-     ├── ALLOWED → forwards to Origin Server
-     │             adds X-RateLimit-Remaining header
-     │             logs audit event to S3 buffer
-     │             returns Origin's response with 200
-     └── REJECTED → returns 429 immediately
-                    adds Retry-After header
-                    publishes alert to AWS SNS
-                    logs audit event to S3 buffer
-                    does NOT contact Origin Server
-
-5. (Async, every 1s) Batch Sync Daemon wakes up
-   • For each client with unsynced usage:
-     - Captures delta (tokens consumed since last sync)
-     - Runs Lua script atomically on Redis / ElastiCache:
-         * Uses Redis TIME (no clock skew)
-         * Refills Redis-side tokens based on elapsed time
-         * Deducts delta
-         * Returns authoritative global token count
-     - Reconciles local bucket: local_tokens ← global_tokens
-
-6. (Async, every 30s) S3 Audit Flush Daemon wakes up
-   • Collects all buffered audit events
-   • Writes as timestamped JSONL file to S3
-   • Re-queues on failure (no data loss)
-
-7. Origin Server processes allowed request
-   • Queries "database" (hardcoded product list)
-   • Returns JSON product catalogue
-
-8. Response travels back:
-   Origin → Shield (adds X-RateLimit headers)
-          → Edge POP (adds x-served-by-pop header)
-          → CDN (adds X-CDN-Routed-To header)
-          → Client
+[ Client ]
+   │  GET /products
+   │  x-api-key: demo-key, X-Region: mumbai
+   ▼
+[ Layer 1: CDN / Reverse Proxy (Nginx :8080) ]
+   │  • Reads X-Region (or round-robin across POPs)
+   │  • Injects routing header: X-CDN-Routed-To: mumbai
+   ▼
+[ Layer 2: Regional Edge Worker (Mumbai :8001) ]
+   │  • Identifies client: client_id = "key:demo-key"
+   │  • Tags headers: x-client-id: key:demo-key, x-pop: mumbai
+   │  • Ships structured log to AWS CloudWatch Logs (stream: edge-mumbai)
+   │  • Proxies request to Origin Shield
+   ▼
+[ Layer 3: Origin Shield (:9000 Internal) — The Enforcement Gatekeeper ]
+   │
+   ├── Step 1: Memory lookup for client's Token Bucket
+   ├── Step 2: Lazy refill based on monotonic time elapsed:
+   │           tokens = min(capacity, tokens + elapsed * refill_rate)
+   ├── Step 3: Check: Are tokens >= 1.0?
+   │
+   ├───► [ BRANCH A: ALLOWED (tokens >= 1.0) ]
+   │       1. Deduct 1.0 token from local bucket
+   │       2. Increment unsynced_delta += 1.0 (for next 1s Redis sync)
+   │       3. Append audit record to in-memory S3 buffer
+   │       4. Emit SSE event to Live Dashboard (Green comet particle)
+   │       5. Forward request to Origin Server (:8000)
+   │       6. Receive 200 OK from Origin
+   │       7. Attach rate limit headers:
+   │          X-RateLimit-Limit: 20
+   │          X-RateLimit-Remaining: 19
+   │          X-RateLimit-Policy: 20;w=2
+   │       8. Return HTTP 200 to Edge Worker
+   │
+   └───► [ BRANCH B: REJECTED / RATE-LIMITED (tokens < 1.0) ]
+           1. Tokens remain untouched (< 1.0)
+           2. Calculate retry_after = ceil(1.0 / refill_rate)
+           3. Publish push notification to AWS SNS (email / SMS alert)
+           4. Append denial audit record to in-memory S3 buffer
+           5. Emit SSE event to Live Dashboard (Neon red particle + 429 shockwave)
+           6. Short-circuit: DO NOT CONTACT ORIGIN SERVER!
+           7. Return HTTP 429 Too Many Requests directly:
+              Status: 429
+              Retry-After: 1
+              X-RateLimit-Limit: 20
+              X-RateLimit-Remaining: 0
+              X-RateLimit-Policy: 20;w=2
+   ▼
+[ Layer 4: Origin Server (:8000 Internal) — Allowed Requests Only ]
+   │  • Executes application business logic
+   │  • Queries product catalog "database"
+   │  • Returns JSON product response
+   ▼
+[ Layer 5: Response Return Pipeline ]
+   Origin (200 OK) ──► Shield (injects X-RateLimit-*) 
+                    ──► Edge Worker (injects x-served-by-pop) 
+                    ──► CDN (injects X-CDN-Routed-To) 
+                    ──► Client
 ```
+
+---
+
+## 🪣 Deep Dive: In-Memory Token Bucket & Redis Synchronization
+
+### 1. In-Memory Token Bucket Mechanics
+
+Rate limiting decisions must occur in **sub-millisecond time** without blocking the event loop or waiting on a network call. The Shield achieves this through an asynchronous in-memory token bucket:
+
+* **Capacity ($C$)**: The maximum burst capacity (e.g., `20` tokens).
+* **Refill Rate ($r$)**: How quickly tokens replenish (e.g., `10` tokens/sec).
+* **Monotonic Lazy Refill**: Instead of running background timers per client (which would waste CPU and memory for thousands of clients), the bucket computes refills **lazily** on the arrival of every request:
+  $$\text{elapsed} = t_{\text{current}} - t_{\text{last\_refill}}$$
+  $$\text{tokens} = \min\left(C, \; \text{tokens} + \text{elapsed} \times r\right)$$
+  $$\text{last\_refill} = t_{\text{current}}$$
+* **Thread & Coroutine Safety**: Each client bucket is isolated behind an `asyncio.Lock()` to prevent race conditions during rapid concurrent requests.
+
+---
+
+### 2. The Distributed Challenge: Why Not Call Redis on Every Request?
+
+In traditional distributed architectures, services call Redis on *every incoming request*. However:
+1. **Network Latency**: Each Redis round-trip adds 1–5ms over local networks and 15–50ms across regions.
+2. **Network Bottleneck**: At 10,000 requests/sec across 3 edge locations, Redis becomes a single point of congestion and failure.
+
+**Our Solution: Asynchronous Batch Synchronization (1-Second Windows)**
+1. The Shield evaluates and grants/denies tokens **locally in memory with zero network delay**.
+2. Each grant increments an internal counter: `unsynced_delta += 1.0`.
+3. Every `1.0s`, a background daemon collects the deltas and synchronizes them with Redis in a single atomic batch.
+
+---
+
+### 3. The Atomic Redis Lua Script (`LUA_SYNC_SCRIPT`)
+
+When the Batch Sync Daemon wakes up, it transmits the local `delta` to Redis or AWS ElastiCache. An atomic Lua script executes inside Redis to update the authoritative global state:
+
+```lua
+local key       = KEYS[1]
+local delta     = tonumber(ARGV[1])
+local capacity  = tonumber(ARGV[2])
+local refill    = tonumber(ARGV[3])
+local ttl       = tonumber(ARGV[4])
+
+-- 1. Use Redis server wall-clock TIME to avoid distributed clock skew across nodes
+local t         = redis.call('TIME')
+local now_sec   = tonumber(t[1]) + tonumber(t[2]) / 1e6
+
+-- 2. Fetch stored global token count and timestamp
+local stored    = redis.call('HMGET', key, 'tokens', 'last_ts')
+local tokens    = tonumber(stored[1]) or capacity
+local last_ts   = tonumber(stored[2]) or now_sec
+
+-- 3. Refill global quota based on true elapsed wall-clock time
+local elapsed   = math.max(0, now_sec - last_ts)
+tokens          = math.min(capacity, tokens + elapsed * refill)
+
+-- 4. Deduct the usage delta reported by this Shield instance
+tokens          = math.max(0, tokens - delta)
+
+-- 5. Persist state back to Redis hash with automatic TTL
+redis.call('HMSET', key, 'tokens', tokens, 'last_ts', now_sec)
+redis.call('EXPIRE', key, ttl)
+
+-- 6. Return authoritative global token count
+return tostring(tokens)
+```
+
+---
+
+### 4. Drift Compensation & Global Convergence
+
+After Redis calculates the updated authoritative token count $G$, the Shield reconciles its local memory:
+
+$$\text{local\_tokens} \leftarrow \min\left(C, \; \max(0, \; G)\right)$$
+
+* **Drift**: The difference between local tokens and global authoritative tokens is tracked live as `Drift = |local_tokens - global_tokens|`.
+* **Convergence**: Over every 1-second interval, drift converges to near zero, ensuring that the combined traffic from Mumbai, Delhi, and Bengaluru strictly respects the global rate limit without exceeding the configured limit.
+
+---
+
+### 5. Chaos Resilience: Fail-Open Mode During Redis Outages
+
+What happens if Redis crashes or AWS ElastiCache becomes unreachable?
+
+```
+[ Redis / ElastiCache Outage Occurs ]
+                    │
+                    ▼
+[ Batch Sync Daemon Catches Connection Exception ]
+                    │
+                    ├── 1. Restores unsynced delta: bucket.unsynced_delta += delta
+                    ├── 2. Does NOT crash or drop client traffic
+                    ├── 3. Enters FAIL-OPEN MODE: Shield continues serving from local memory
+                    └── 4. Publishes redis_status: ok=False to Live Dashboard
+```
+
+* **Zero Downtime**: Users are not met with 500 Internal Server Errors; the Shield continues enforcing local quotas independently.
+* **Self-Healing Reconnection**: When Redis or ElastiCache comes back online, the next sync cycle connects, flushes the accumulated delta, reconciles the global bucket, and clears the alert banner automatically.
 
 ---
 
@@ -565,64 +669,213 @@ docker compose down -v   # stops containers and removes volumes
 
 ---
 
-## 🖥️ Live Mission Control Dashboard
+## 🖥️ Live Mission Control Dashboard — Complete Reference
 
-A cinematic, real-time sci-fi "Mission Control" dashboard at **http://localhost:3000** that visualizes everything happening across the distributed edge network — designed for projector presentations and live audience demonstrations.
+The Live Mission Control Dashboard is a standalone, real-time, zero-build web application served at **http://localhost:3000**. Designed like a sci-fi network operations center (NOC), it renders every distributed event physically and audibly without external build steps (pure modern ES modules + Canvas API + Chart.js + GSAP).
 
-### Opening the Dashboard
-
-```bash
-docker compose up --build     # starts all services including the dashboard
-# Then open http://localhost:3000 in your browser
+```
+┌────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  🟢 EDGE RATE LIMITER  │  "Client key:demo-key → 120 req/s across 3 POPs. Shield: 167 allowed, 1833 rejected."  │  DEMO  FX  │
+├───────────────────────┬────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ ⚙ CONTROL PANEL       │ 🗺 LIVE TOPOLOGY (~55% Viewport)                                                               │
+│                       │   [Internet]          [Edge Network]          [Origin Shield]           [AWS Cloud]            │
+│  API Key: [demo-key]  │   👤 Clients ───────► 🏙 Mumbai ───────────► 🛡 Shield ──────────────► 📦 Origin             │
+│  Region:  [Mixed ▼]   │          │            🏛 Delhi    ───────────►    │                                        │
+│  [▸ Send] [⚡ Burst]   │          └─────────► 🌴 Bengaluru ────────►    ├─── (1s Sync) ──────► 🗄 Redis / ElastiCache  │
+│                       │                                                   ├─── (On 429)  ──────► 📢 AWS SNS Alert      │
+│  Load Test:           │   Green Comets = Allowed (200 OK)                 ├─── (Audit)   ──────► 📦 AWS S3 Logs        │
+│   RPS: [== 100 ==]    │   Red Shards + 429 = Denied (HTTP 429)            └─── (Logs)    ──────► ☁ AWS CloudWatch      │
+│   Duration: [= 10 =]  ├───────────────────────────────┬────────────────────────────────┬───────────────────────────────┤
+│   [▶ Start] [■ Stop]  │ 🪣 TOKEN BUCKET               │ 📈 THROUGHPUT & LATENCY        │ ⚖ GLOBAL LIMIT PROOF          │
+│                       │   Liquid Wave Level (Local)   │   1833 Total │ 167 OK │ 1833 429│   Status: [ HOLDING ]         │
+│  Capacity:  [ 20 ]    │   --- CAP Mark (20)           │   120 RPS    │ 1.2ms p50 Latency│   Actual Allowed:   167       │
+│  Refill/s:  [ 10 ]    │   --- GLOBAL Mark (Authorit.) │   Area Chart (Green vs Red)    │   Expected Allowed: 120 ±15%  │
+│                       ├───────────────────────────────┴────────────────────────────────┴───────────────────────────────┤
+│  Redis Control:       │ 📋 LIVE EVENT FEED (Terminal)                  │ 🔄 SYNC DAEMON TIMELINE                       │
+│  [Kill] [Restore]     │   21:45:01 [ALLOW] key:demo-key mumbai rem=18  │   #24 Δ=10 G=12.4 drift=0.2  [LOCAL REDIS]     │
+│                       │   21:45:02 [DENY]  key:demo-key delhi  retry=1s│   #25 Δ=10 G=10.0 drift=0.0  [LOCAL REDIS]     │
+└───────────────────────┴────────────────────────────────────────────────┴───────────────────────────────────────────────┘
 ```
 
-### Dashboard Panels & Features
+---
 
-| Panel / Feature | Description |
-|---|---|
-| **A. Hero Topology (~55% Viewport)** | Full-width Canvas with live particle physics. Allowed requests travel as glowing green comets; denied requests burst as vivid neon red particles with comet trails hitting the Shield, triggering shockwaves, 429 popups, and red shard bursts. Bezier links pulse with traffic. Amber pulses visualize the Redis batch sync daemon. |
-| **B. Liquid Token Bucket** | Physics-based vessel with sine-wave liquid surface, capacity tick mark, authoritative global Redis marker, falling token droplets, and live drift readout. |
-| **C. Throughput & Counters** | Rolling 60-second gradient area chart (allowed vs denied). Giant 36px+ neon JetBrains Mono odometer counters for Total, Allowed, Denied, Deny %, RPS, and p50/p95 latency in ms. |
-| **D. Global Limit Proof Card** | Evaluates actual allowed requests against the theoretical rate ($C + r \times \Delta t$) starting from first request with dynamic tolerance bands. Badges honestly display `HOLDING` or `DRIFTING`. |
-| **E. POP Distribution** | Glass cards for Mumbai, Delhi, and Bengaluru with real SVG location markers, animated allow/deny split bars, and request tallies. |
-| **F. Live Request Feed** | Terminal-style log with colored status badges (`ALLOW`, `DENY`, `SYNC`, `SNS`, `S3`), slide-in animations, and filter controls. |
-| **G. Sync Daemon Timeline** | Horizontal timeline tracking batch sync ticks: delta reported ($\Delta$), global tokens ($G$), and drift compensation. |
-| **H. Control Panel** | Left sidebar: API key & region selector, Send 1 / Burst 30, continuous load test generator (1-500 RPS slider), live capacity/refill configuration, bucket reset, Redis kill/restore, and quick presets. |
-| **I. Guided Demo Tour** | Click **▸ Guided Demo** in the header for an auto-play narrated 8-step interactive tour that spotlights panels and triggers real network events. |
-| **J. Presentation Mode** | Press <kbd>F</kbd> to hide the control sidebar and maximize topology & live counters for a projector display, with floating quick-controls. |
-| **K. Low FX Mode** | Click **FX** in the header to toggle reduced effects (disables background starfield drift, canvas particle trails, and blur for low-spec hardware). Respects `prefers-reduced-motion`. |
+### Design System & Visual Grammar
 
-### Keyboard Shortcuts
+The dashboard employs a strict visual hierarchy where color represents system state and physical action:
 
-| Shortcut | Action |
-|---|---|
-| <kbd>F</kbd> | Toggle Presentation Mode (fullscreen projector layout) |
-| <kbd>→</kbd> / <kbd>Space</kbd> | Next step in Guided Demo |
-| <kbd>←</kbd> | Previous step in Guided Demo |
-| <kbd>Esc</kbd> | Exit Guided Demo |
+| Color | Hex | Meaning in Mission Control |
+|---|---|---|
+| **Neon Green** | `#00ff9d` | **Allowed Request (200 OK)**: Traffic permitted through the bucket; flows cleanly to Origin. |
+| **Neon Red** | `#ff2e63` | **Rate-Limited Rejection (429)**: Bucket empty; particle bursts at Shield, triggering shockwaves and alerts. |
+| **Amber** | `#ffb020` | **Redis Synchronization**: 1-second background daemon ticks, delta reporting, and authoritative global markers. |
+| **Cyan** | `#22d3ee` | **CDN & Edge POPs**: Client routing, geographic edge distribution (Mumbai, Delhi, Bengaluru). |
+| **Violet** | `#a78bfa` | **AWS Cloud Infrastructure**: Telemetry to CloudWatch Logs, SNS Alert Topics, and S3 Audit Buckets. |
+| **Deep Space** | `#05070f` | **Canvas & Background**: Multi-layered drifting starfield with radial vignette for depth. |
+
+---
+
+### UI Panels Deep Dive
+
+#### 1. Header Bar & Live "What's Happening" Ticker
+* **Pulsing Health Ring**: Emits soft radar pulses; turns solid green when all services and SSE are connected, and pulses red if Redis is unreachable.
+* **Live Narration Ticker**: A central telemetry marquee that interprets live events into plain-English sentences:
+  > *"Client key:demo-key → 100 req/s across 3 POPs. Shield: 120 allowed, 880 rejected. Global rate limit holding."*
+* **Guided Demo Trigger (`▸ Guided Demo`)**: Starts an automated 8-step scripted tour.
+* **FX Toggle (`FX`)**: Toggles low-power mode (disables blur filters and particle trails for low-end hardware).
+* **Connection Badge & System Clock**: Displays live SSE heartbeat and millisecond-accurate UTC time.
+
+---
+
+#### 2. Hero Topology Canvas (Top ~55% Viewport)
+Replaces static SVG with a 60fps Hardware-Accelerated Canvas scene featuring real-time particle physics:
+* **Zone Labeled Infrastructure**: Clearly grouped into 4 functional regions:
+  1. `Internet` (Clients, CDN)
+  2. `Edge Network` (Mumbai, Delhi, Bengaluru POPs)
+  3. `Origin Shield` (Shield, Redis / ElastiCache)
+  4. `AWS Cloud` (CloudWatch, SNS, S3)
+* **Organic Bezier Links**: Curved connection conduits with flowing dash animations that scale in thickness and glow intensity with traffic volume.
+* **Traffic Particles & Comet Trails**:
+  * **Allowed Requests**: Vivid green comets fly Client → CDN → POP → Shield → Origin, then return as a fast success pulse.
+  * **Denied Requests**: Bright neon red (`#ff2e63`) particles travel from the client to the Shield, where they **detonate on impact**, triggering:
+    1. An expanding neon red shockwave ring.
+    2. An explosion of 10 red flying shard sparks.
+    3. Physical screen-space jitter on the Shield card.
+    4. A floating bold neon `"429"` badge rising above the Shield node.
+* **Ambient Idle Animation**: Even when traffic is idle, gentle ambient particles drift along links to maintain a living, breathing NOC environment.
+* **Shield Mini-Gauge**: Inside the Shield node card, an embedded liquid gauge displays real-time token depletion and replenishment.
+* **Fail-Open Outage Mode**: If Redis is killed or unreachable:
+  * The Shield $\leftrightarrow$ Redis conduit snaps into a broken, sparking red dashed line.
+  * The Redis node grays out and displays a flashing `FAIL` badge.
+  * A screen-wide red vignette pulses with the warning banner: `REDIS UNREACHABLE: FAIL-OPEN MODE — serving from local bucket`.
+
+---
+
+#### 3. Token Bucket Visualizer
+Provides a physical, visual metaphor for the in-memory token bucket algorithm:
+* **Physical Glass Cylinder Vessel**: Shows a live animated sine-wave fluid surface representing available local tokens.
+* **Liquid Color States**:
+  * Neon Green ($>50\%$ capacity): Normal operation, plenty of tokens remaining.
+  * Amber ($20\% - 50\%$ capacity): Heavy traffic, bucket draining.
+  * Neon Red ($<20\%$ capacity): Critical capacity, imminent 429 rejections.
+* **Falling Token Droplets**: Every allowed request visibly consumes a token, dropping a liquid bead out of the bottom of the vessel. Incoming refills drip in continuously from the top.
+* **Authoritative Reference Markers**:
+  * White Dashed Line (`CAP`): Maximum burst capacity (e.g., 20 tokens).
+  * Amber Dashed Line (`GLOBAL`): The authoritative global count reported back by Redis during the last 1-second sync cycle.
+* **Drift Readout**: Shows $| \text{local} - \text{global} |$, verifying how closely the edge node tracks the global cluster.
+* **Unsynced $\Delta$**: Displays the number of consumed tokens queued locally for the next sync.
+* **Mini Token History Chart**: A rolling 60-second line chart showing token levels over time.
+* **Dynamic Plain-English Caption**: Continuously explains current state (e.g., *"Bucket at 85%. Refilling at 10 tokens/sec. Each request costs 1."*).
+
+---
+
+#### 4. Throughput & Latency Panel
+* **Giant 36px+ Neon Odometer Numbers**: Features rolling count-up animations for key metrics:
+  * **Total**: Combined request volume.
+  * **Allowed**: Requests granted HTTP 200 (Green).
+  * **Denied**: Requests rejected with HTTP 429 (Red).
+  * **Deny %**: Percentage of traffic filtered out by the middleware.
+  * **RPS**: Live instantaneous requests per second.
+  * **p50 & p95 Latency**: Decision latencies measured in exact milliseconds (sub-millisecond decisions, typically 0.8ms to 1.4ms).
+* **Glowing Area Chart**: Rolling 60-second window displaying allowed traffic (green gradient fill) versus rate-limited rejections (red gradient fill).
+
+---
+
+#### 5. Global Limit Proof Card
+Mathematically proves that the distributed rate limiter prevents quota abuse across all 3 POPs combined:
+* **The Mathematical Formula**:
+  $$\text{Expected Allowed} = \text{Capacity} + (\text{Refill Rate} \times \Delta t_{\text{elapsed}})$$
+  *Elapsed time is measured from the FIRST request of an active run (not page load) and resets after 5s of inactivity.*
+* **Tolerance Band Progress Bar**: Compares actual allowed requests against the expected theoretical limit with a $\pm 15\%$ visual tolerance band.
+* **Honest Verdict Badge**:
+  * `HOLDING` (Neon Green): Actual allowed traffic strictly matches the theoretical limit.
+  * `DRIFTING` (Amber / Red): Flags unexpected quota variance with the exact discrepancy reason.
+
+---
+
+#### 6. POP Distribution Panel
+* **3 Regional Glass Cards**: Displays real-time metrics for **Mumbai**, **Delhi**, and **Bengaluru**.
+* **SVG Map Markers**: Color-coded geographic pins.
+* **Split Allow/Deny Progress Bars**: Shows what portion of each region's traffic was allowed versus rejected.
+* **Global Consistency Verification**: Proves that even if one POP (e.g., Mumbai) receives 80% of the traffic, the global quota holds without allowing extra requests through Delhi or Bengaluru.
+
+---
+
+#### 7. Live Request Feed
+* **Terminal-Style Scrolling Console**: Captures the latest 200 events with monospaced precision.
+* **Status Badges**:
+  * `[ALLOW]`: Green badge with client ID, POP, and remaining tokens.
+  * `[DENY]`: Red badge with client ID, POP, and calculated `Retry-After` seconds.
+  * `[SYNC]`: Amber badge detailing batch sync delta and authoritative global tokens.
+  * `[SNS]`: Violet badge recording real-time alert publications.
+  * `[S3]`: Violet badge tracking audit batch flushes.
+* **Interactive Controls**: Features a pause/resume toggle (`⏸` / `▶`) and instant filtering (`All`, `Allow`, `Deny`, `Sync / AWS`).
+
+---
+
+#### 8. Sync Daemon Timeline
+* **Horizontal Synchronous Tape**: A scrolling strip of sync cards ticking every 1.0 second.
+* **Card Details**:
+  * Sync Sequence ID (e.g., `#42`).
+  * $\Delta$ reported (tokens consumed locally).
+  * Authoritative global token count returned from Redis.
+  * Drift corrected during reconciliation.
+  * Connection mode badge (`LOCAL REDIS` vs `ELASTICACHE`).
+
+---
+
+#### 9. Interactive Guided Demo Tour
+Clicking **`▸ Guided Demo`** in the header launches an automated 90-second interactive tour:
+* Dims the background with a cinematic spotlight cutout on each active panel.
+* Typewriter-animated narration explains each architectural concept in plain English.
+* Automatically triggers real backend actions at each step:
+  1. *Single Request*: Fires 1 request through CDN and traces the green comet particle.
+  2. *Geographic Spread*: Bursts traffic across all 3 POPs simultaneously.
+  3. *Local Shield Evaluation*: Spotlights zero-latency local in-memory token deduction.
+  4. *Rate Limit Enforcement*: Bursts 60 requests, emptying the bucket and triggering 429 shockwaves and red shard bursts.
+  5. *Batch Synchronization*: Highlights the amber sync conduit reconciling counts with Redis.
+  6. *Global Limit Proof*: Launches a 10s load test and verifies the mathematical proof card.
+  7. *Fail-Open Demonstration*: Simulates a Redis outage, demonstrating uninterrupted traffic flow.
+  8. *AWS Recap*: Lights up CloudWatch, SNS, and S3 nodes in sequence.
+
+---
+
+#### 10. Presentation Mode (<kbd>F</kbd> Key)
+* Designed specifically for **projector presentations**, conference screens, and executive demos.
+* Hides the configuration sidebar and maximizes the topology canvas and live counters.
+* Displays a minimal, floating glass quick-control bar in the bottom right corner with `▸ Send`, `⚡ Burst`, and `Exit (F)`.
+
+---
+
+#### 11. Low FX Mode
+* Click the **`FX`** button in the header (or configure your OS for `prefers-reduced-motion`).
+* Instantly disables CPU-heavy CSS blurs, canvas comet trails, and background starfield animations for smooth 60fps performance on low-power laptops.
+
+---
 
 ### Dashboard API Endpoints
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/api/stream` | SSE stream (proxied from shield) |
-| `GET` | `/api/state` | JSON state snapshot (proxied from shield) |
-| `POST` | `/api/fire` | Send 1 request through CDN |
-| `POST` | `/api/burst` | Send N requests through CDN |
-| `POST` | `/api/load/start` | Start continuous load test |
-| `POST` | `/api/load/stop` | Stop load test |
-| `GET` | `/api/load/status` | Load test progress |
-| `POST` | `/api/config` | Live-adjust capacity/refill |
-| `POST` | `/api/reset` | Reset a client bucket |
-| `GET` | `/api/health` | Aggregated health of all services |
-| `POST` | `/api/docker/redis/stop` | Stop Redis (requires `DASHBOARD_ALLOW_DOCKER_CONTROL=true`) |
-| `POST` | `/api/docker/redis/start` | Start Redis (requires `DASHBOARD_ALLOW_DOCKER_CONTROL=true`) |
+| `GET` | `/api/stream` | Server-Sent Events (SSE) stream delivering real-time telemetry from the Shield event bus. |
+| `GET` | `/api/state` | JSON state snapshot (counters, active client buckets, AWS configuration, health). |
+| `POST` | `/api/fire` | Dispatches a single test request through the CDN (`{"api_key": "...", "region": "..."}`). |
+| `POST` | `/api/burst` | Dispatches a burst of $N$ concurrent requests through the CDN. |
+| `POST` | `/api/load/start` | Initiates continuous synthetic load test (configurable RPS and duration). |
+| `POST` | `/api/load/stop` | Halts any running synthetic load test immediately. |
+| `GET` | `/api/load/status` | Polling endpoint for active load test metrics. |
+| `POST` | `/api/config` | Live-adjusts bucket capacity ($C$) and refill rate ($r$) across all active clients. |
+| `POST` | `/api/reset` | Resets a client's bucket back to full capacity and clears Redis key. |
+| `GET` | `/api/health` | Aggregates health probe data from CDN, 3 Edge POPs, Shield, Origin, and Redis. |
+| `POST` | `/api/docker/redis/stop` | Chaos engineering: Stops the Redis container to test fail-open mode. |
+| `POST` | `/api/docker/redis/start` | Chaos engineering: Restarts the Redis container to test self-healing sync. |
 
-### New Environment Variables
+---
 
-| Variable | Default | Description |
+### Dashboard Configuration & Environment Variables
+
+| Variable | Default | Purpose |
 |---|---|---|
-| `DASHBOARD_ALLOW_DOCKER_CONTROL` | `false` | Enable Kill/Restore Redis buttons. Requires Docker socket mount. |
+| `DASHBOARD_ALLOW_DOCKER_CONTROL` | `false` | When set to `true` (and `/var/run/docker.sock` is mounted), enables the Kill/Restore Redis buttons in the control panel for live chaos testing. |
 
 ### Demo Flow
 
